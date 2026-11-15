@@ -128,6 +128,9 @@ impl EventLoop {
                         Event::Resize(cols, rows) => {
                             self.on_resize(cols, rows)?;
                         }
+                        Event::Paste(text) => {
+                            self.on_paste(&text)?;
+                        }
                         _ => {}
                     }
                 }
@@ -215,6 +218,26 @@ impl EventLoop {
         self.renderer.set_status_label(label);
         self.renderer.redraw(&mut io::stdout(), size)?;
         Ok(KeyResult::Continue)
+    }
+
+    fn on_paste(&mut self, text: &str) -> anyhow::Result<()> {
+        let size = self.size;
+        let mut prompt = match mem::replace(&mut self.mode, Mode::Output) {
+            Mode::Prompt(prompt) => prompt,
+            other => {
+                self.mode = other;
+                return Ok(());
+            }
+        };
+        if prompt.insert_pasted(text) {
+            self.renderer
+                .set_prompt_status(prompt.status_label(), prompt.caret_cols());
+            self.mode = Mode::Prompt(prompt);
+            self.renderer.draw(&mut io::stdout(), size)?;
+        } else {
+            self.mode = Mode::Prompt(prompt);
+        }
+        Ok(())
     }
 
     fn on_prompt_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {

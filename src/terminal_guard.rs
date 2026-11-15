@@ -3,6 +3,8 @@ use std::io::Write;
 
 use crossterm::cursor::Hide;
 use crossterm::cursor::Show;
+use crossterm::event::DisableBracketedPaste;
+use crossterm::event::EnableBracketedPaste;
 use crossterm::queue;
 use crossterm::terminal::EnterAlternateScreen;
 use crossterm::terminal::LeaveAlternateScreen;
@@ -18,7 +20,7 @@ impl TerminalGuard {
     pub(crate) fn enter_alt_mode() -> io::Result<TerminalGuard> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        queue!(stdout, EnterAlternateScreen, Hide)?;
+        queue!(stdout, EnterAlternateScreen, Hide, EnableBracketedPaste)?;
         stdout.flush()?;
         Ok(TerminalGuard { active: true })
     }
@@ -39,7 +41,7 @@ impl Drop for TerminalGuard {
 /// Used by `Drop` and by the panic hook (`panic = "abort"` skips `Drop`).
 pub(crate) fn restore_terminal() {
     let mut stdout = io::stdout();
-    let _ = queue!(stdout, LeaveAlternateScreen, Show);
+    let _ = queue!(stdout, DisableBracketedPaste, LeaveAlternateScreen, Show);
     let _ = stdout.flush();
     let _ = disable_raw_mode();
 }

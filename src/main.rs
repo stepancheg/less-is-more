@@ -46,12 +46,7 @@ use crate::terminal_guard::restore_terminal;
 #[derive(clap::Parser, Debug)]
 struct Args {
     /// Seconds between command runs.
-    #[clap(
-        short = 'n',
-        long,
-        env = "LESS_IS_MORE_INTERVAL",
-        default_value = "2"
-    )]
+    #[clap(short = 'n', long, env = "LESS_IS_MORE_INTERVAL", default_value = "2")]
     interval: IntervalArg,
 
     /// Command to run.

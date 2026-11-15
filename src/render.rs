@@ -43,6 +43,8 @@ pub(crate) struct Renderer {
     status_caret: Option<u32>,
     /// Literal pattern whose matches are drawn with a search highlight.
     highlight: Option<Highlight>,
+    /// Bumped when body rows may have changed (`set_lines` / highlight).
+    content_gen: u64,
 }
 
 /// Active search highlight. `current` is the selected match's line and byte offset.
@@ -58,6 +60,9 @@ struct DrawnFrame {
     status: String,
     caret: u32,
     cursor: bool,
+    pos: LinePos,
+    content_gen: u64,
+    ruler: String,
 }
 
 impl Renderer {
@@ -70,6 +75,7 @@ impl Renderer {
             status_label: None,
             status_caret: None,
             highlight: None,
+            content_gen: 0,
         }
     }
 
@@ -79,6 +85,7 @@ impl Renderer {
         current: Option<(usize, usize)>,
         ignore_case: bool,
     ) {
+        self.content_gen = self.content_gen.wrapping_add(1);
         self.highlight = match pattern {
             Some(pattern) if !pattern.is_empty() => Some(Highlight {
                 pattern,
@@ -108,6 +115,7 @@ impl Renderer {
     }
 
     pub(crate) fn set_lines(&mut self, lines: Vec<Line>, size: Size) {
+        self.content_gen = self.content_gen.wrapping_add(1);
         self.lines = lines;
         self.clamp_pos_to_lines();
         self.set_top_row(self.viewport_top_row(size), size);
@@ -224,6 +232,13 @@ impl Renderer {
     }
 
     fn draw_frame(&mut self, out: &mut impl Write, size: Size, force: bool) -> io::Result<()> {
+        if !force && self.body_cache_valid(size) {
+            let ruler = match &self.drawn {
+                Some(drawn) => drawn.ruler.clone(),
+                None => String::new(),
+            };
+            return self.paint_status(out, size, &ruler);
+        }
         let terminal_width = size.width;
         let body_height = content_height(size.height.0);
         let light_terminal = self.terminal_bg == TerminalBg::Light;
@@ -288,7 +303,59 @@ impl Renderer {
             status,
             caret,
             cursor: show_cursor,
+            pos: self.pos,
+            content_gen: self.content_gen,
+            ruler,
         });
+        Ok(())
+    }
+
+    fn body_cache_valid(&self, size: Size) -> bool {
+        match &self.drawn {
+            Some(drawn) => {
+                drawn.size == size && drawn.pos == self.pos && drawn.content_gen == self.content_gen
+            }
+            None => false,
+        }
+    }
+
+    /// Repaint only the status row and cursor. Body rows stay as they are.
+    fn paint_status(&mut self, out: &mut impl Write, size: Size, ruler: &str) -> io::Result<()> {
+        let ruler_cols = display_width(ruler).0.min(size.width.0);
+        let label_cols = if ruler_cols == 0 {
+            size.width.0
+        } else {
+            size.width.0.saturating_sub(ruler_cols).saturating_sub(1)
+        };
+        let show_cursor = self.status_caret.is_some();
+        let (label, caret) = match &self.status_label {
+            Some(label) => {
+                let caret = self.status_caret.unwrap_or_else(|| display_width(label).0);
+                fit_label_to_caret(label, Width(label_cols), caret)
+            }
+            None => (String::new(), 0),
+        };
+        let status = status_bar_fingerprint(self.terminal_bg, size.width, &label, ruler);
+        let unchanged = match &self.drawn {
+            Some(drawn) => {
+                drawn.status == status && drawn.caret == caret && drawn.cursor == show_cursor
+            }
+            None => false,
+        };
+        if unchanged {
+            return Ok(());
+        }
+        let mut stream = Vec::new();
+        write_status_bar(&mut stream, size, &status)?;
+        stream.extend_from_slice(b"\x1b[0m");
+        write_cursor(&mut stream, size, caret, show_cursor)?;
+        out.write_all(&stream)?;
+        out.flush()?;
+        if let Some(drawn) = self.drawn.as_mut() {
+            drawn.status = status;
+            drawn.caret = caret;
+            drawn.cursor = show_cursor;
+        }
         Ok(())
     }
 
@@ -1143,6 +1210,22 @@ mod tests {
         assert_eq!(vt100::Color::Idx(7), cell.bgcolor());
         let pad = parser.screen().cell(1, 9).unwrap();
         assert_eq!(vt100::Color::Idx(7), pad.bgcolor());
+    }
+
+    #[test]
+    fn test_status_update_does_not_repaint_body() {
+        let mut renderer = Renderer::new(TerminalBg::Dark);
+        let size = size(10, 3);
+        renderer.set_lines(parse_command_output(b"a\nb\nc\nd\n"), size);
+        let mut buf = Vec::new();
+        renderer.draw(&mut buf, size).unwrap();
+        assert_eq!(true, buf.windows(4).any(|w| w == b"\x1b[2J"));
+        buf.clear();
+        renderer.set_prompt_status("/hi".to_owned(), 3);
+        renderer.draw(&mut buf, size).unwrap();
+        assert_eq!(false, buf.is_empty());
+        assert_eq!(false, buf.windows(4).any(|w| w == b"\x1b[2J"));
+        assert_eq!(true, buf.windows(3).any(|w| w == b"/hi"));
     }
 
     #[test]

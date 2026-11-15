@@ -48,6 +48,24 @@ impl Prompt {
         label
     }
 
+    /// Insert `text` at the caret. Control characters are dropped so
+    /// the query stays a single line. Returns whether anything was inserted.
+    pub(crate) fn insert_pasted(&mut self, text: &str) -> bool {
+        let mut buf = String::new();
+        for c in text.chars() {
+            if !c.is_control() {
+                buf.push(c);
+            }
+        }
+        if buf.is_empty() {
+            return false;
+        }
+        self.query.insert_str(self.cursor, &buf);
+        self.cursor += buf.len();
+        self.history_pos = None;
+        true
+    }
+
     pub(crate) fn take_query(&mut self) -> String {
         self.cursor = 0;
         std::mem::take(&mut self.query)
@@ -300,6 +318,16 @@ mod tests {
             prompt.on_key(&press(KeyCode::Enter, KeyModifiers::NONE), &[])
         );
         assert_eq!("a", prompt.take_query());
+    }
+
+    #[test]
+    fn test_prompt_insert_pasted() {
+        let mut prompt = Prompt::new(true);
+        assert_eq!(true, prompt.insert_pasted("ab\nc\td"));
+        assert_eq!("/abcd", prompt.status_label());
+        assert_eq!(5, prompt.caret_cols());
+        assert_eq!(false, prompt.insert_pasted("\n\t"));
+        assert_eq!("/abcd", prompt.status_label());
     }
 
     #[test]
