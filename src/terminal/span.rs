@@ -1,6 +1,6 @@
-use crate::output::style::Style;
-use crate::output::terminal_str::string::TerminalString;
-use crate::output::width::Width;
+use crate::terminal::style::Style;
+use crate::terminal::terminal_str::string::TerminalString;
+use crate::terminal::width::Width;
 
 /// One run of terminal chars that share a style.
 #[derive(Clone, Debug, Eq, PartialEq)]

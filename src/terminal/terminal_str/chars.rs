@@ -1,6 +1,6 @@
-use crate::output::terminal_str::char_indices::TerminalCharIndices;
-use crate::output::terminal_str::char_ref::TerminalCharRef;
-use crate::output::terminal_str::str::TerminalStr;
+use crate::terminal::terminal_str::char_indices::TerminalCharIndices;
+use crate::terminal::terminal_str::char_ref::TerminalCharRef;
+use crate::terminal::terminal_str::str::TerminalStr;
 
 /// Iterator over graphemes of a `TerminalStr` with width tracking.
 #[derive(Debug, Clone)]

@@ -1,5 +1,5 @@
-use crate::output::color::TerminalColor;
-use crate::output::parse::Parser;
+use crate::terminal::color::TerminalColor;
+use crate::terminal::parse::Parser;
 
 fn push_color_sgr(s: &mut String, color: TerminalColor, foreground: bool) {
     match color {
@@ -226,8 +226,8 @@ impl Style {
 
 #[cfg(test)]
 mod tests {
-    use crate::output::color::TerminalColor;
-    use crate::output::style::Style;
+    use crate::terminal::color::TerminalColor;
+    use crate::terminal::style::Style;
 
     #[test]
     fn test_zero_resets() {

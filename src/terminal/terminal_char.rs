@@ -1,7 +1,7 @@
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::output::width::Width;
+use crate::terminal::width::Width;
 
 /// One grapheme safe to print. Terminal width is 1 or 2.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,8 +37,8 @@ impl TerminalChar {
 
 #[cfg(test)]
 mod tests {
-    use crate::output::terminal_char::TerminalChar;
-    use crate::output::width::Width;
+    use crate::terminal::terminal_char::TerminalChar;
+    use crate::terminal::width::Width;
 
     #[test]
     fn test_ascii() {

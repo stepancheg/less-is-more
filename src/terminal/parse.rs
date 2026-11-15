@@ -1,13 +1,13 @@
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::debug_or_test::DEBUG_OR_TEST;
-use crate::output::line::Line;
-use crate::output::span::Span;
-use crate::output::style::Style;
-use crate::output::terminal_char::TerminalChar;
-use crate::output::terminal_str::str::TerminalStr;
-use crate::output::terminal_str::string::TerminalString;
-use crate::output::width::Width;
+use crate::terminal::line::Line;
+use crate::terminal::span::Span;
+use crate::terminal::style::Style;
+use crate::terminal::terminal_char::TerminalChar;
+use crate::terminal::terminal_str::str::TerminalStr;
+use crate::terminal::terminal_str::string::TerminalString;
+use crate::terminal::width::Width;
 
 /// Parse command output into lines of styled terminal-char spans.
 ///
@@ -235,12 +235,12 @@ enum NextSpan {
 
 #[cfg(test)]
 mod tests {
-    use crate::output::color::TerminalColor;
-    use crate::output::line::Line;
-    use crate::output::parse::Parser;
-    use crate::output::parse::parse_command_output;
-    use crate::output::style::Style;
-    use crate::output::width::Width;
+    use crate::terminal::color::TerminalColor;
+    use crate::terminal::line::Line;
+    use crate::terminal::parse::Parser;
+    use crate::terminal::parse::parse_command_output;
+    use crate::terminal::style::Style;
+    use crate::terminal::width::Width;
 
     fn plain(lines: &[Line]) -> Vec<String> {
         lines
@@ -373,7 +373,7 @@ mod tests {
         assert_eq!("", parser.rem_input);
     }
 
-    fn span_text(span: &crate::output::span::Span) -> &str {
+    fn span_text(span: &crate::terminal::span::Span) -> &str {
         span.content.as_ref().as_str()
     }
 }

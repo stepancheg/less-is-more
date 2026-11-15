@@ -5,10 +5,10 @@ use std::ops::Deref;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::output::terminal_str::chars::TerminalChars;
-use crate::output::terminal_str::string::TerminalString;
-use crate::output::terminal_str::width_len::WidthLen;
-use crate::output::width::Width;
+use crate::terminal::terminal_str::chars::TerminalChars;
+use crate::terminal::terminal_str::string::TerminalString;
+use crate::terminal::terminal_str::width_len::WidthLen;
+use crate::terminal::width::Width;
 
 /// Borrowed text safe to print, with its display width cached. No control characters.
 #[derive(Clone, Copy, Eq, PartialEq, derive_more::Display)]
@@ -279,8 +279,8 @@ impl<'a> Deref for TerminalStr<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::output::terminal_str::str::TerminalStr;
-    use crate::output::width::Width;
+    use crate::terminal::terminal_str::str::TerminalStr;
+    use crate::terminal::width::Width;
 
     #[test]
     fn test_take_iterate_from_start() {

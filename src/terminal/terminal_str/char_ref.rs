@@ -1,8 +1,8 @@
 use ref_cast::ref_cast_custom;
 
-use crate::output::terminal_str::str::TerminalStr;
-use crate::output::terminal_str::width_len::WidthLen;
-use crate::output::width::Width;
+use crate::terminal::terminal_str::str::TerminalStr;
+use crate::terminal::terminal_str::width_len::WidthLen;
+use crate::terminal::width::Width;
 
 #[derive(Debug, derive_more::Display, ref_cast::RefCastCustom)]
 #[repr(transparent)]

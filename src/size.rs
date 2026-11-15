@@ -1,5 +1,5 @@
 use crate::height::Height;
-use crate::output::width::Width;
+use crate::terminal::width::Width;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Size {

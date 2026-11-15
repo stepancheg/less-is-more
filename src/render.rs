@@ -2,16 +2,20 @@ use std::cmp;
 use std::io;
 use std::io::Write;
 
+use crossterm::cursor::Hide;
 use crossterm::cursor::MoveTo;
+use crossterm::cursor::Show;
 use crossterm::queue;
 use crossterm::terminal::Clear;
 use crossterm::terminal::ClearType;
+use unicode_width::UnicodeWidthChar;
 
 use crate::height::Height;
-use crate::output::line::Line;
-use crate::output::width::Width;
 use crate::size::Size;
+use crate::terminal::line::Line;
+use crate::terminal::width::Width;
 use crate::terminal_bg::TerminalBg;
+use crate::theme::search_highlight;
 
 /// Styled view of parsed lines. `row` is the top rendered-row index.
 pub(crate) struct Renderer {
@@ -19,12 +23,26 @@ pub(crate) struct Renderer {
     lines: Vec<Line>,
     drawn: Option<DrawnFrame>,
     terminal_bg: TerminalBg,
+    /// Replaces the `(END)` label while a prompt or message is showing.
+    status_label: Option<String>,
+    /// Caret column in `status_label`. `None` means the end of the label.
+    status_caret: Option<u32>,
+    /// Literal pattern whose matches are drawn with a search highlight.
+    highlight: Option<Highlight>,
+}
+
+/// Active search highlight. `current` is the selected match's line and byte offset.
+struct Highlight {
+    pattern: String,
+    current: Option<(usize, usize)>,
+    ignore_case: bool,
 }
 
 struct DrawnFrame {
     size: Size,
     rows: Vec<String>,
     status: String,
+    caret: u32,
 }
 
 impl Renderer {
@@ -34,7 +52,44 @@ impl Renderer {
             lines: Vec::new(),
             drawn: None,
             terminal_bg,
+            status_label: None,
+            status_caret: None,
+            highlight: None,
         }
+    }
+
+    pub(crate) fn set_highlight(
+        &mut self,
+        pattern: Option<String>,
+        current: Option<(usize, usize)>,
+        ignore_case: bool,
+    ) {
+        self.highlight = match pattern {
+            Some(pattern) if !pattern.is_empty() => Some(Highlight {
+                pattern,
+                current,
+                ignore_case,
+            }),
+            _ => None,
+        };
+    }
+
+    pub(crate) fn lines(&self) -> &[Line] {
+        &self.lines
+    }
+
+    pub(crate) fn set_status_label(&mut self, label: Option<String>) {
+        self.status_label = label;
+        self.status_caret = None;
+    }
+
+    pub(crate) fn status_label(&self) -> Option<&str> {
+        self.status_label.as_deref()
+    }
+
+    pub(crate) fn set_prompt_status(&mut self, label: String, caret_cols: u32) {
+        self.status_label = Some(label);
+        self.status_caret = Some(caret_cols);
     }
 
     pub(crate) fn set_lines(&mut self, lines: Vec<Line>, size: Size) {
@@ -71,6 +126,64 @@ impl Renderer {
         self.row = self.row.saturating_sub(step);
     }
 
+    pub(crate) fn scroll_to_line(&mut self, line_idx: usize, size: Size) {
+        self.row = visual_row_of_logical_line(&self.lines, size.width, line_idx);
+        self.clamp_row(size);
+    }
+
+    pub(crate) fn scroll_to_match(&mut self, line_idx: usize, byte_start: usize, size: Size) {
+        let base = visual_row_of_logical_line(&self.lines, size.width, line_idx);
+        let offset = match self.lines.get(line_idx) {
+            Some(line) => visual_row_offset_for_byte(line, size.width, byte_start),
+            None => 0,
+        };
+        let match_row = base.saturating_add(offset);
+        let body = content_height(size.height.0);
+        // Leave the page alone when the hit is already visible. If it is
+        // off-screen, center it in the content area, as Neovim does for a
+        // jump that moves the cursor outside the window.
+        if body == 0 {
+            self.row = match_row;
+            self.clamp_row(size);
+            return;
+        }
+        let top = self.row;
+        let bottom = top.saturating_add(body - 1);
+        if match_row < top || match_row > bottom {
+            self.row = match_row.saturating_sub(body / 2);
+        }
+        self.clamp_row(size);
+    }
+
+    pub(crate) fn top_row(&self) -> u32 {
+        self.row
+    }
+
+    pub(crate) fn top_line_index(&self, size: Size) -> usize {
+        if self.lines.is_empty() {
+            return 0;
+        }
+        logical_line_at_visual_row(&self.lines, size.width, self.row)
+    }
+
+    pub(crate) fn bottom_line_index(&self, size: Size) -> usize {
+        if self.lines.is_empty() {
+            return 0;
+        }
+        let body = content_height(size.height.0);
+        let count = visual_rows(&self.lines, size.width, None, false).len();
+        if count == 0 {
+            return 0;
+        }
+        let last = if body == 0 {
+            self.row as usize
+        } else {
+            self.row as usize + body as usize - 1
+        };
+        let last = cmp::min(last, count - 1);
+        logical_line_at_visual_row(&self.lines, size.width, last as u32)
+    }
+
     pub(crate) fn draw(&mut self, out: &mut impl Write, size: Size) -> io::Result<()> {
         self.draw_frame(out, size, false)
     }
@@ -82,7 +195,13 @@ impl Renderer {
     fn draw_frame(&mut self, out: &mut impl Write, size: Size, force: bool) -> io::Result<()> {
         let terminal_width = size.width;
         let body_height = content_height(size.height.0);
-        let all = visual_rows(&self.lines, terminal_width);
+        let light_terminal = self.terminal_bg == TerminalBg::Light;
+        let all = visual_rows(
+            &self.lines,
+            terminal_width,
+            self.highlight.as_ref(),
+            light_terminal,
+        );
         self.row = cmp::min(self.row, max_row(all.len(), body_height));
         let start = cmp::min(self.row as usize, all.len());
         let end = cmp::min(start.saturating_add(body_height as usize), all.len());
@@ -90,10 +209,23 @@ impl Renderer {
         let mut all = all;
         let visible: Vec<VisualRow> = all.drain(start..end).collect();
         let keys: Vec<String> = visible.iter().map(row_fingerprint).collect();
-        let status = status_bar_fingerprint(self.terminal_bg, size.width, at_end);
+        let show_cursor = self.status_label.is_some();
+        let (label, caret) = match &self.status_label {
+            Some(label) => {
+                let caret = self.status_caret.unwrap_or_else(|| display_width(label).0);
+                fit_label_to_caret(label, size.width, caret)
+            }
+            None if at_end => (take_prefix_cols("(END)", size.width), 0),
+            None => (String::new(), 0),
+        };
+        let status = status_bar_fingerprint(self.terminal_bg, size.width, &label);
         let unchanged = match &self.drawn {
             Some(drawn) => {
-                !force && drawn.size == size && drawn.rows == keys && drawn.status == status
+                !force
+                    && drawn.size == size
+                    && drawn.rows == keys
+                    && drawn.status == status
+                    && drawn.caret == caret
             }
             None => false,
         };
@@ -105,18 +237,20 @@ impl Renderer {
         write_one_line(&visible, terminal_width, &mut stream)?;
         write_status_bar(&mut stream, size, &status)?;
         stream.extend_from_slice(b"\x1b[0m");
+        write_cursor(&mut stream, size, caret, show_cursor)?;
         out.write_all(&stream)?;
         out.flush()?;
         self.drawn = Some(DrawnFrame {
             size,
             rows: keys,
             status,
+            caret,
         });
         Ok(())
     }
 
     fn clamp_row(&mut self, size: Size) {
-        let count = visual_rows(&self.lines, size.width).len();
+        let count = visual_rows(&self.lines, size.width, None, false).len();
         self.row = cmp::min(self.row, max_row(count, content_height(size.height.0)));
     }
 }
@@ -155,24 +289,136 @@ fn row_fingerprint(row: &VisualRow) -> String {
     s
 }
 
-fn status_bar_fingerprint(terminal_bg: TerminalBg, width: Width, at_end: bool) -> String {
+fn status_bar_fingerprint(terminal_bg: TerminalBg, width: Width, label: &str) -> String {
     if width == 0 {
         return String::new();
     }
     let mut line = String::from(terminal_bg.status_bar_sgr());
-    let label = if at_end { "(END)" } else { "" };
-    let max = width.0 as usize;
-    let label = if label.len() > max {
-        &label[..max]
-    } else {
-        label
-    };
     line.push_str(label);
-    let pad = max - label.len();
-    for _ in 0..pad {
+    let mut cols = display_width(label);
+    while cols < width {
         line.push(' ');
+        cols += Width(1);
     }
     line
+}
+
+fn write_cursor(out: &mut impl Write, size: Size, caret: u32, show_cursor: bool) -> io::Result<()> {
+    if size.height.0 == 0 || size.width == 0 {
+        return Ok(());
+    }
+    if !show_cursor {
+        queue!(out, Hide)?;
+        return Ok(());
+    }
+    let Ok(row) = u16::try_from(size.height.0 - 1) else {
+        return Ok(());
+    };
+    let col = if caret < size.width.0 {
+        caret
+    } else {
+        size.width.0.saturating_sub(1)
+    };
+    let Ok(col) = u16::try_from(col) else {
+        return Ok(());
+    };
+    queue!(out, MoveTo(col, row), Show)?;
+    Ok(())
+}
+
+fn display_width(s: &str) -> Width {
+    let mut cols = 0u32;
+    for c in s.chars() {
+        cols = cols.saturating_add(char_width(c));
+    }
+    Width(cols)
+}
+
+fn char_width(c: char) -> u32 {
+    u32::try_from(c.width_cjk().unwrap_or(0)).unwrap_or(0)
+}
+
+fn take_prefix_cols(s: &str, width: Width) -> String {
+    let mut out = String::new();
+    let mut cols = Width(0);
+    for c in s.chars() {
+        let w = Width(char_width(c));
+        if cols + w > width {
+            break;
+        }
+        out.push(c);
+        cols += w;
+    }
+    out
+}
+
+/// Visible slice of `label` that keeps the caret on screen, and the caret
+/// column within that slice.
+fn fit_label_to_caret(label: &str, width: Width, caret_cols: u32) -> (String, u32) {
+    let total = display_width(label).0;
+    if width == 0 {
+        return (String::new(), 0);
+    }
+    if total <= width.0 {
+        return (label.to_owned(), caret_cols.min(total));
+    }
+    let caret = caret_cols.min(total);
+    // Keep the caret inside a `width`-column window. Prefer showing the
+    // text before the caret (caret near the right edge).
+    let mut start = caret.saturating_sub(width.0.saturating_sub(1));
+    if start + width.0 > total {
+        start = total - width.0;
+    }
+    let visible = slice_cols(label, start, width.0);
+    (visible, caret - start)
+}
+
+fn slice_cols(s: &str, skip_cols: u32, max_cols: u32) -> String {
+    let mut out = String::new();
+    let mut skipped = 0u32;
+    let mut taken = 0u32;
+    for c in s.chars() {
+        let w = char_width(c);
+        if skipped < skip_cols {
+            // Drop whole characters until we have skipped enough columns.
+            // A double-width char that would overshoot the skip is dropped too
+            // so the window stays on a character boundary.
+            skipped = skipped.saturating_add(w);
+            continue;
+        }
+        if taken + w > max_cols {
+            break;
+        }
+        out.push(c);
+        taken += w;
+    }
+    out
+}
+
+fn visual_row_of_logical_line(lines: &[Line], terminal_width: Width, line_idx: usize) -> u32 {
+    let mut acc = 0u32;
+    for line in lines.iter().take(line_idx) {
+        let n = u32::try_from(line_visual_rows(line, terminal_width, None, 0, false).len())
+            .unwrap_or(u32::MAX);
+        acc = acc.saturating_add(n);
+    }
+    acc
+}
+
+fn logical_line_at_visual_row(lines: &[Line], terminal_width: Width, visual_row: u32) -> usize {
+    let mut acc = 0u32;
+    for (i, line) in lines.iter().enumerate() {
+        let n = u32::try_from(line_visual_rows(line, terminal_width, None, 0, false).len())
+            .unwrap_or(u32::MAX);
+        // A blank line still occupies one visual row, so n is at least 1
+        // unless the terminal width is 0.
+        let n = cmp::max(n, 1);
+        if visual_row < acc.saturating_add(n) {
+            return i;
+        }
+        acc = acc.saturating_add(n);
+    }
+    lines.len().saturating_sub(1)
 }
 
 fn write_status_bar(out: &mut impl Write, size: Size, status: &str) -> io::Result<()> {
@@ -212,30 +458,94 @@ fn write_one_line(
     Ok(())
 }
 
-fn visual_rows(lines: &[Line], terminal_width: Width) -> Vec<VisualRow> {
+fn visual_rows(
+    lines: &[Line],
+    terminal_width: Width,
+    highlight: Option<&Highlight>,
+    light_terminal: bool,
+) -> Vec<VisualRow> {
     let mut rows = Vec::new();
     if terminal_width == 0 {
         return rows;
     }
-    for line in lines {
-        for part in line_visual_rows(line, terminal_width) {
+    for (line_idx, line) in lines.iter().enumerate() {
+        for part in line_visual_rows(line, terminal_width, highlight, line_idx, light_terminal) {
             rows.push(part);
         }
     }
     rows
 }
 
-fn line_visual_rows(line: &Line, terminal_width: Width) -> Vec<VisualRow> {
+fn visual_row_offset_for_byte(line: &Line, terminal_width: Width, byte_start: usize) -> u32 {
+    if terminal_width == 0 {
+        return 0;
+    }
+    let mut col = Width(0);
+    let mut row = 0u32;
+    let mut byte_off = 0usize;
+    for span in &line.spans {
+        for ch in span.content.as_ref().chars() {
+            if byte_off >= byte_start {
+                return row;
+            }
+            let text = ch.as_str().as_str();
+            byte_off += text.len();
+            let w = ch.width();
+            if w > terminal_width {
+                continue;
+            }
+            if col + w > terminal_width {
+                row = row.saturating_add(1);
+                col = Width(0);
+            }
+            col += w;
+        }
+    }
+    row
+}
+
+fn line_visual_rows(
+    line: &Line,
+    terminal_width: Width,
+    highlight: Option<&Highlight>,
+    line_idx: usize,
+    light_terminal: bool,
+) -> Vec<VisualRow> {
     let mut rows = Vec::new();
     if terminal_width == 0 {
         return rows;
     }
+    let ranges = match highlight {
+        Some(highlight) => line.match_ranges(&highlight.pattern, highlight.ignore_case),
+        None => Vec::new(),
+    };
+    let current_byte = match highlight {
+        Some(highlight) => match highlight.current {
+            Some((cur_line, byte)) if cur_line == line_idx => Some(byte),
+            _ => None,
+        },
+        None => None,
+    };
     let mut pieces: Vec<Piece> = Vec::new();
     let mut col = Width(0);
     let mut soft_wrap = false;
+    let mut byte_off = 0usize;
     for span in &line.spans {
-        let sgr = span.style.sgr_sequence();
+        let plain_sgr = span.style.sgr_sequence();
+        let highlight_sgr = search_highlight(span.style, light_terminal, false).sgr_sequence();
+        let current_sgr = search_highlight(span.style, light_terminal, true).sgr_sequence();
         for ch in span.content.as_ref().chars() {
+            let text = ch.as_str().as_str();
+            let ch_end = byte_off + text.len();
+            let in_match = ranges
+                .iter()
+                .find(|&&(start, end)| byte_off < end && ch_end > start);
+            let sgr = match in_match {
+                Some(&(start, _)) if current_byte == Some(start) => &current_sgr,
+                Some(_) => &highlight_sgr,
+                None => &plain_sgr,
+            };
+            byte_off = ch_end;
             let w = ch.width();
             if w > terminal_width {
                 continue;
@@ -251,15 +561,15 @@ fn line_visual_rows(line: &Line, terminal_width: Width) -> Vec<VisualRow> {
                 soft_wrap = true;
             }
             match pieces.last_mut() {
-                Some(last) if last.sgr == sgr => {
-                    last.text.push_str(ch.as_str().as_str());
+                Some(last) if last.sgr == *sgr => {
+                    last.text.push_str(text);
                 }
                 _ => {
-                    let mut text = String::new();
-                    text.push_str(ch.as_str().as_str());
+                    let mut owned = String::new();
+                    owned.push_str(text);
                     pieces.push(Piece {
                         sgr: sgr.clone(),
-                        text,
+                        text: owned,
                     });
                 }
             }
@@ -287,11 +597,22 @@ pub(crate) fn terminal_size() -> io::Result<Size> {
 #[cfg(test)]
 mod tests {
     use crate::height::Height;
-    use crate::output::parse::parse_command_output;
-    use crate::output::width::Width;
     use crate::render::Renderer;
     use crate::size::Size;
+    use crate::terminal::color::TerminalColor;
+    use crate::terminal::parse::parse_command_output;
+    use crate::terminal::width::Width;
     use crate::terminal_bg::TerminalBg;
+    use crate::theme::NVIM_DARK_GREY1;
+    use crate::theme::NVIM_DARK_YELLOW;
+    use crate::theme::NVIM_LIGHT_YELLOW;
+
+    fn vt_color(color: TerminalColor) -> vt100::Color {
+        match color {
+            TerminalColor::Rgb(r, g, b) => vt100::Color::Rgb(r, g, b),
+            _ => vt100::Color::Default,
+        }
+    }
 
     fn size(width: u32, height: u32) -> Size {
         Size {
@@ -530,6 +851,39 @@ mod tests {
         buf.clear();
         renderer.redraw(&mut buf, size(10, 2)).unwrap();
         assert_eq!(false, buf.is_empty());
+    }
+
+    #[test]
+    fn test_search_highlight_sets_bg() {
+        let mut renderer = Renderer::new(TerminalBg::Dark);
+        let size = size(20, 3);
+        renderer.set_lines(
+            parse_command_output(b"xxFOOyy\na\x1b[31mFOO\x1b[0mb\n"),
+            size,
+        );
+        renderer.set_highlight(Some("FOO".to_owned()), Some((0, 2)), false);
+        let mut buf = Vec::new();
+        renderer.draw(&mut buf, size).unwrap();
+        let mut parser = vt100::Parser::new(3, 20, 0);
+        parser.process(&buf);
+        assert_eq!("xxFOOyy", row_text(&parser, 0, 20));
+        let plain = |col: u16| parser.screen().cell(0, col).unwrap();
+        assert_eq!(vt100::Color::Default, plain(0).bgcolor());
+        assert_eq!(vt100::Color::Default, plain(1).bgcolor());
+        // Dark terminal: current hit is light yellow, other hits are dark yellow.
+        assert_eq!(vt_color(NVIM_LIGHT_YELLOW), plain(2).bgcolor());
+        assert_eq!(vt_color(NVIM_LIGHT_YELLOW), plain(3).bgcolor());
+        assert_eq!(vt_color(NVIM_LIGHT_YELLOW), plain(4).bgcolor());
+        assert_eq!(vt_color(NVIM_DARK_GREY1), plain(2).fgcolor());
+        assert_eq!(vt100::Color::Default, plain(5).bgcolor());
+        // Match that crosses a style boundary, on the next line: "a" + "FOO" + "b".
+        let crossed = |col: u16| parser.screen().cell(1, col).unwrap();
+        assert_eq!("aFOOb", row_text(&parser, 1, 20));
+        assert_eq!(vt100::Color::Default, crossed(0).bgcolor());
+        assert_eq!(vt_color(NVIM_DARK_YELLOW), crossed(1).bgcolor());
+        assert_eq!(vt_color(NVIM_DARK_YELLOW), crossed(2).bgcolor());
+        assert_eq!(vt_color(NVIM_DARK_YELLOW), crossed(3).bgcolor());
+        assert_eq!(vt100::Color::Default, crossed(4).bgcolor());
     }
 
     #[test]

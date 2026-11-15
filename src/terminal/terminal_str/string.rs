@@ -4,9 +4,9 @@ use std::fmt::Display;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::output::terminal_char::TerminalChar;
-use crate::output::terminal_str::str::TerminalStr;
-use crate::output::width::Width;
+use crate::terminal::terminal_char::TerminalChar;
+use crate::terminal::terminal_str::str::TerminalStr;
+use crate::terminal::width::Width;
 
 #[derive(Clone, Eq, PartialEq, derive_more::Display, Debug)]
 #[display("{content}")]
@@ -161,10 +161,10 @@ impl<'a> PartialEq<TerminalString> for &'a str {
 
 #[cfg(test)]
 mod tests {
-    use crate::output::terminal_char::TerminalChar;
-    use crate::output::terminal_str::str::TerminalStr;
-    use crate::output::terminal_str::string::TerminalString;
-    use crate::output::width::Width;
+    use crate::terminal::terminal_char::TerminalChar;
+    use crate::terminal::terminal_str::str::TerminalStr;
+    use crate::terminal::terminal_str::string::TerminalString;
+    use crate::terminal::width::Width;
 
     #[test]
     fn test_pop_char() {

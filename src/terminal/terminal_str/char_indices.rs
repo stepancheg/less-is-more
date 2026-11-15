@@ -1,10 +1,10 @@
 use unicode_segmentation::GraphemeIndices;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::output::terminal_str::char_ref::TerminalCharRef;
-use crate::output::terminal_str::str::TerminalStr;
-use crate::output::terminal_str::width_len::WidthLen;
-use crate::output::width::Width;
+use crate::terminal::terminal_str::char_ref::TerminalCharRef;
+use crate::terminal::terminal_str::str::TerminalStr;
+use crate::terminal::terminal_str::width_len::WidthLen;
+use crate::terminal::width::Width;
 
 /// Iterator returning pairs of (offset, char) for [`TerminalStr`].
 #[derive(Debug, Clone)]
@@ -63,8 +63,8 @@ impl<'a> DoubleEndedIterator for TerminalCharIndices<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::output::terminal_str::char_indices::TerminalCharIndices;
-    use crate::output::terminal_str::str::TerminalStr;
+    use crate::terminal::terminal_str::char_indices::TerminalCharIndices;
+    use crate::terminal::terminal_str::str::TerminalStr;
 
     #[test]
     fn test_char_indices() {
