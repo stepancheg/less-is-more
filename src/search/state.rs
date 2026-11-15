@@ -11,37 +11,62 @@ pub(crate) const INVALID_PATTERN: &str = "Invalid pattern";
 
 /// Status line to show after a command-output refresh.
 /// "Pattern not found" and the `-i`/`-I` case-mode message stay up
-/// until the user issues a command.
+/// until the user issues a command. The case-mode message is rebuilt
+/// from the fresh `[i/n]` count so it cannot keep a stale total.
 pub(crate) fn status_after_output(
     current_status: Option<&str>,
     match_label: Option<String>,
 ) -> Option<String> {
     if let Some(status) = current_status {
-        if is_case_mode_status(status) {
-            return Some(status.to_owned());
+        if let Some(mode_label) = case_mode_label_in(status) {
+            return Some(with_match_label(mode_label, match_label.as_deref()));
         }
         if status == INVALID_PATTERN {
             return Some(INVALID_PATTERN.to_owned());
         }
         if status.starts_with(PATTERN_NOT_FOUND) {
-            return match match_label {
-                Some(label) => {
-                    let mut msg = String::from(PATTERN_NOT_FOUND);
-                    msg.push(' ');
-                    msg.push_str(&label);
-                    Some(msg)
-                }
-                None => Some(PATTERN_NOT_FOUND.to_owned()),
-            };
+            return Some(with_match_label(PATTERN_NOT_FOUND, match_label.as_deref()));
         }
     }
     match_label
 }
 
-fn is_case_mode_status(status: &str) -> bool {
-    status == CaseMode::Sensitive.label()
-        || status == CaseMode::IgnoreCase.label()
-        || status == CaseMode::IgnoreCaseAlways.label()
+pub(crate) fn is_case_mode_status(status: &str) -> bool {
+    case_mode_label_in(status).is_some()
+}
+
+/// Mode label at the start of a case-mode status, with or without a
+/// trailing ` [i/n]` count. "Ignore case" is a prefix of
+/// "Ignore case always", so the longer label is tested first.
+fn case_mode_label_in(status: &str) -> Option<&'static str> {
+    let labels = [
+        CaseMode::IgnoreCaseAlways.label(),
+        CaseMode::IgnoreCase.label(),
+        CaseMode::Sensitive.label(),
+    ];
+    for label in labels {
+        if status == label {
+            return Some(label);
+        }
+        if let Some(rest) = status.strip_prefix(label) {
+            if rest.starts_with(' ') {
+                return Some(label);
+            }
+        }
+    }
+    None
+}
+
+fn with_match_label(prefix: &str, match_label: Option<&str>) -> String {
+    match match_label {
+        Some(label) => {
+            let mut msg = String::from(prefix);
+            msg.push(' ');
+            msg.push_str(label);
+            msg
+        }
+        None => prefix.to_owned(),
+    }
 }
 
 /// less `-i` / `-I` case handling.
@@ -62,6 +87,11 @@ impl CaseMode {
             CaseMode::IgnoreCase => "Ignore case",
             CaseMode::Sensitive => "Case sensitive",
         }
+    }
+
+    /// Case-mode announcement, plus the current `[i/n]` count when there is one.
+    pub(crate) fn status(&self, match_label: Option<&str>) -> String {
+        with_match_label(self.label(), match_label)
     }
 }
 
@@ -170,6 +200,27 @@ impl Search {
         self.current = Some((occ.line, occ.byte_start));
     }
 
+    /// If no hit is selected, select the first one on `top_line..=bottom_line`.
+    /// Does not move the viewport.
+    pub(crate) fn select_visible_match(
+        &mut self,
+        lines: &[Line],
+        top_line: usize,
+        bottom_line: usize,
+    ) {
+        if self.current.is_some() {
+            return;
+        }
+        let occs = occurrences(lines, &self.pattern, self.folds_pattern());
+        let Some(occ) = occs
+            .iter()
+            .find(|occ| occ.line >= top_line && occ.line <= bottom_line)
+        else {
+            return;
+        };
+        self.current = Some((occ.line, occ.byte_start));
+    }
+
     /// Vim-style `[i/n]` for the selected hit, if there is one.
     pub(crate) fn match_label(&self, lines: &[Line]) -> Option<String> {
         let (line, byte) = self.current?;
@@ -255,6 +306,47 @@ mod tests {
     }
 
     #[test]
+    fn test_toggle_ignore_case_refreshes_hits() {
+        let mut renderer = Renderer::new(TerminalBg::Dark);
+        let size = size(10, 6);
+        renderer.set_lines(parse_command_output(b"FOO\nfoo\nFoo\nbar\n"), size);
+        let mut search = Search::new();
+        assert_eq!(
+            SearchOutcome::Found,
+            submit_prompt(&mut renderer, &mut search, size, true, "foo".to_owned())
+        );
+        assert_eq!(
+            Some("[1/1]".to_owned()),
+            search.match_label(renderer.lines())
+        );
+        let anchor = search.anchor(renderer.lines());
+        search.toggle_ignore_case();
+        search.reattach(renderer.lines(), anchor);
+        search.apply_highlight(&mut renderer);
+        assert_eq!(
+            Some("[2/3]".to_owned()),
+            search.match_label(renderer.lines())
+        );
+        assert_eq!(
+            "Ignore case [2/3]",
+            search
+                .case_mode()
+                .status(search.match_label(renderer.lines()).as_deref())
+        );
+        let mut buf = Vec::new();
+        renderer.redraw(&mut buf, size).unwrap();
+        let mut parser = vt100::Parser::new(
+            std::num::NonZeroU16::new(6).unwrap(),
+            std::num::NonZeroU16::new(10).unwrap(),
+            0,
+        );
+        parser.process(&buf);
+        // "FOO" on line 0 is now a hit.
+        let cell = parser.screen().cell(0, 0).unwrap();
+        assert_eq!(false, cell.bgcolor() == vt100::Color::Default);
+    }
+
+    #[test]
     fn test_reattach_keeps_current_across_refresh() {
         let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = size(20, 8);
@@ -296,7 +388,7 @@ mod tests {
         );
         assert_eq!(None, status_after_output(None, None));
         assert_eq!(
-            Some("Ignore case".to_owned()),
+            Some("Ignore case [2/3]".to_owned()),
             status_after_output(Some("Ignore case"), Some("[2/3]".to_owned()))
         );
         assert_eq!(
@@ -304,8 +396,66 @@ mod tests {
             status_after_output(Some("Ignore case always"), None)
         );
         assert_eq!(
-            Some("Case sensitive".to_owned()),
+            Some("Case sensitive [1/1]".to_owned()),
             status_after_output(Some("Case sensitive"), Some("[1/1]".to_owned()))
+        );
+        // A stale count on the case-mode line is replaced, not kept.
+        // "Ignore case always" must not be read as "Ignore case" + " always".
+        assert_eq!(
+            Some("Ignore case [4/5]".to_owned()),
+            status_after_output(Some("Ignore case [2/3]"), Some("[4/5]".to_owned()))
+        );
+        assert_eq!(
+            Some("Ignore case always [1/2]".to_owned()),
+            status_after_output(Some("Ignore case always [9/9]"), Some("[1/2]".to_owned()))
+        );
+        assert_eq!(
+            Some("Ignore case".to_owned()),
+            status_after_output(Some("Ignore case [2/3]"), None)
+        );
+    }
+
+    #[test]
+    fn test_toggle_ignore_case_selects_visible_hit() {
+        let mut renderer = Renderer::new(TerminalBg::Dark);
+        // Height 6 → 5 body rows. 12 lines, so the last page starts at line 7
+        // and does not include the line-0 "foo".
+        let size = size(10, 6);
+        renderer.set_lines(
+            parse_command_output(b"foo\nx\nx\nx\nx\nx\nx\nx\nx\nx\nFOO\nfoo\n"),
+            size,
+        );
+        let mut search = Search::new();
+        assert_eq!(
+            SearchOutcome::Found,
+            submit_prompt(&mut renderer, &mut search, size, true, "foo".to_owned())
+        );
+        assert_eq!(
+            Some("[1/2]".to_owned()),
+            search.match_label(renderer.lines())
+        );
+        // A move drops the selected hit. -i must still adopt a visible hit
+        // under the new case mode, without scrolling.
+        renderer.scroll_bottom(size);
+        search.clear_match();
+        let top = renderer.top_line_index(size);
+        assert_eq!(7, top);
+        search.toggle_ignore_case();
+        search.reattach(renderer.lines(), None);
+        search.select_visible_match(renderer.lines(), top, renderer.bottom_line_index(size));
+        search.apply_highlight(&mut renderer);
+        assert_eq!(7, renderer.top_line_index(size));
+        // Visible ignore-case hits are line 10 "FOO" and line 11 "foo".
+        // All hits are foo, FOO, foo → the on-screen FOO is [2/3].
+        assert_eq!(
+            Some("[2/3]".to_owned()),
+            search.match_label(renderer.lines())
+        );
+        assert_eq!(
+            "Ignore case [2/3]",
+            search
+                .case_mode()
+                .status(search.match_label(renderer.lines()).as_deref())
         );
     }
 }

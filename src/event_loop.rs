@@ -28,6 +28,7 @@ use crate::search::state::INVALID_PATTERN;
 use crate::search::state::NO_PREVIOUS_SEARCH;
 use crate::search::state::PATTERN_NOT_FOUND;
 use crate::search::state::Search;
+use crate::search::state::is_case_mode_status;
 use crate::search::state::status_after_output;
 use crate::size::Size;
 use crate::terminal::line::Line;
@@ -211,9 +212,16 @@ impl EventLoop {
                 self.search.toggle_ignore_case();
             }
             self.search.reattach(self.renderer.lines(), anchor);
+            let top_line = self.renderer.top_line_index(size);
+            let bottom_line = self.renderer.bottom_line_index(size);
+            self.search
+                .select_visible_match(self.renderer.lines(), top_line, bottom_line);
             self.search.apply_highlight(&mut self.renderer);
-            self.renderer
-                .set_status_label(Some(self.search.case_mode().label().to_owned()));
+            let status = self
+                .search
+                .case_mode()
+                .status(self.search.match_label(self.renderer.lines()).as_deref());
+            self.renderer.set_status_label(Some(status));
             self.renderer.redraw(&mut io::stdout(), size)?;
             return Ok(KeyResult::Continue);
         }
@@ -566,6 +574,7 @@ fn is_dismissable_status(status: &str) -> bool {
         || status == NO_PREVIOUS_SEARCH
         || status == INVALID_PATTERN
         || status == NOT_SET
+        || is_case_mode_status(status)
 }
 
 fn key_action(key: &KeyEvent) -> Option<KeyAction> {
