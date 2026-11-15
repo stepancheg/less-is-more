@@ -1,3 +1,4 @@
+use compact_str::CompactString;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -6,7 +7,7 @@ use crate::terminal::width::Width;
 /// One grapheme safe to print. Terminal width is 1 or 2.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TerminalChar {
-    text: String,
+    text: CompactString,
 }
 
 impl TerminalChar {
@@ -23,15 +24,17 @@ impl TerminalChar {
         if width != Width(1) && width != Width(2) {
             return None;
         }
-        Some(TerminalChar { text: s.to_owned() })
+        Some(TerminalChar {
+            text: CompactString::from(s),
+        })
     }
 
     pub(crate) fn as_str(&self) -> &str {
-        &self.text
+        self.text.as_str()
     }
 
     pub(crate) fn width(&self) -> Width {
-        Width(self.text.width_cjk() as u32)
+        Width(self.text.as_str().width_cjk() as u32)
     }
 }
 
