@@ -11,6 +11,7 @@ use crossterm::terminal::ClearType;
 use unicode_width::UnicodeWidthChar;
 
 use crate::height::Height;
+use crate::lines_with_wrapped_row_count::LinesWithWrappedRowCount;
 use crate::size::Size;
 use crate::terminal::line::Line;
 use crate::terminal::line::compile_search;
@@ -34,7 +35,7 @@ pub(crate) struct LinePos {
 pub(crate) struct Renderer {
     /// Top of the viewport in original-line coordinates.
     pos: LinePos,
-    lines: Vec<Line>,
+    lines: LinesWithWrappedRowCount,
     drawn: Option<DrawnFrame>,
     terminal_bg: TerminalBg,
     /// Left side of the status bar while a prompt or message is showing.
@@ -46,6 +47,8 @@ pub(crate) struct Renderer {
     highlight: Option<Highlight>,
     /// Bumped when body rows may have changed (`set_lines` / highlight).
     content_gen: u64,
+    /// Terminal size last given to [`Renderer::update_size`] (or `new`).
+    size: Size,
 }
 
 /// Active search highlight. `current` is the selected match's line and byte offset.
@@ -66,17 +69,30 @@ struct DrawnFrame {
 }
 
 impl Renderer {
-    pub(crate) fn new(terminal_bg: TerminalBg) -> Renderer {
+    pub(crate) fn new(terminal_bg: TerminalBg, size: Size) -> Renderer {
         Renderer {
             pos: LinePos::default(),
-            lines: Vec::new(),
+            lines: LinesWithWrappedRowCount::new(Vec::new(), size.width),
             drawn: None,
             terminal_bg,
             status_label: None,
             status_caret: None,
             highlight: None,
             content_gen: 0,
+            size,
         }
+    }
+
+    /// Store a new terminal size. Recomputes wrap counts when the width
+    /// changes and keeps the same text at the top of the viewport.
+    pub(crate) fn update_size(&mut self, size: Size) {
+        if self.size == size {
+            return;
+        }
+        self.size = size;
+        self.lines.update_width(size.width);
+        let top = self.viewport_top_row();
+        self.set_top_row(top);
     }
 
     pub(crate) fn set_highlight(
@@ -98,7 +114,7 @@ impl Renderer {
     }
 
     pub(crate) fn lines(&self) -> &[Line] {
-        &self.lines
+        self.lines.lines()
     }
 
     pub(crate) fn set_status_label(&mut self, label: Option<String>) {
@@ -115,136 +131,148 @@ impl Renderer {
         self.status_caret = Some(caret_cols);
     }
 
-    pub(crate) fn set_lines(&mut self, lines: Vec<Line>, size: Size) {
+    pub(crate) fn set_lines(&mut self, lines: Vec<Line>) {
         self.content_gen = self.content_gen.wrapping_add(1);
-        self.lines = lines;
+        self.lines = LinesWithWrappedRowCount::new(lines, self.size.width);
         self.clamp_pos_to_lines();
-        self.set_top_row(self.viewport_top_row(size), size);
+        let top = self.viewport_top_row();
+        self.set_top_row(top);
     }
 
-    pub(crate) fn scroll_down(&mut self, size: Size) {
-        let top = self.viewport_top_row(size);
-        self.set_top_row(top.saturating_add(WrappedRow(1)), size);
+    pub(crate) fn scroll_down(&mut self) {
+        let top = self.viewport_top_row();
+        self.set_top_row(top.saturating_add(WrappedRow(1)));
     }
 
-    pub(crate) fn scroll_up(&mut self, size: Size) {
-        let top = self.viewport_top_row(size);
-        self.set_top_row(top.saturating_sub(WrappedRow(1)), size);
+    pub(crate) fn scroll_up(&mut self) {
+        let top = self.viewport_top_row();
+        self.set_top_row(top.saturating_sub(WrappedRow(1)));
     }
 
     pub(crate) fn scroll_top(&mut self) {
         self.pos = LinePos::default();
     }
 
-    pub(crate) fn scroll_bottom(&mut self, size: Size) {
-        self.set_top_row(WrappedRow::MAX, size);
+    pub(crate) fn scroll_bottom(&mut self) {
+        self.set_top_row(WrappedRow::MAX);
     }
 
-    pub(crate) fn scroll_page_down(&mut self, size: Size) {
-        let step = cmp::max(content_height(size.height.0), 1);
-        let top = self.viewport_top_row(size);
-        self.set_top_row(top.saturating_add(WrappedRow(step)), size);
+    pub(crate) fn scroll_page_down(&mut self) {
+        let step = cmp::max(content_height(self.size.height), 1);
+        let top = self.viewport_top_row();
+        self.set_top_row(top.saturating_add(WrappedRow(step)));
     }
 
-    pub(crate) fn scroll_page_up(&mut self, size: Size) {
-        let step = cmp::max(content_height(size.height.0), 1);
-        let top = self.viewport_top_row(size);
-        self.set_top_row(top.saturating_sub(WrappedRow(step)), size);
+    pub(crate) fn scroll_page_up(&mut self) {
+        let step = cmp::max(content_height(self.size.height), 1);
+        let top = self.viewport_top_row();
+        self.set_top_row(top.saturating_sub(WrappedRow(step)));
     }
 
-    pub(crate) fn scroll_to_pos(&mut self, pos: LinePos, size: Size) {
+    pub(crate) fn scroll_to_pos(&mut self, pos: LinePos) {
         self.pos = pos;
         self.clamp_pos_to_lines();
-        self.set_top_row(self.viewport_top_row(size), size);
+        let top = self.viewport_top_row();
+        self.set_top_row(top);
     }
 
     #[cfg_attr(not(test), expect(dead_code))]
-    pub(crate) fn scroll_to_line(&mut self, line_idx: usize, size: Size) {
-        self.set_top_row(
-            visual_row_of_logical_line(&self.lines, size.width, line_idx),
-            size,
-        );
+    pub(crate) fn scroll_to_line(&mut self, line_idx: usize) {
+        self.set_top_row(visual_row_of_line(self.lines.row_counts(), line_idx));
     }
 
-    pub(crate) fn scroll_to_match(&mut self, line_idx: usize, byte_start: usize, size: Size) {
-        let base = visual_row_of_logical_line(&self.lines, size.width, line_idx);
+    pub(crate) fn scroll_to_match(&mut self, line_idx: usize, byte_start: usize) {
+        let base = visual_row_of_line(self.lines.row_counts(), line_idx);
         let offset = match self.lines.get(line_idx) {
-            Some(line) => visual_row_offset_for_byte(line, size.width, byte_start),
+            Some(line) => visual_row_offset_for_byte(line, self.size.width, byte_start),
             None => WrappedRow(0),
         };
         let match_row = base.saturating_add(offset);
-        let body = content_height(size.height.0);
+        let body = content_height(self.size.height);
         // Leave the page alone when the hit is already visible. If it is
         // off-screen, center it in the content area, as Neovim does for a
         // jump that moves the cursor outside the window.
         if body == 0 {
-            self.set_top_row(match_row, size);
+            self.set_top_row(match_row);
             return;
         }
-        let top = self.viewport_top_row(size);
+        let top = self.viewport_top_row();
         let bottom = top.saturating_add(WrappedRow(body - 1));
         if match_row < top || match_row > bottom {
-            self.set_top_row(match_row.saturating_sub(WrappedRow(body / 2)), size);
+            self.set_top_row(match_row.saturating_sub(WrappedRow(body / 2)));
         }
     }
 
     #[cfg_attr(not(test), expect(dead_code))]
-    pub(crate) fn top_row(&self, size: Size) -> WrappedRow {
-        self.viewport_top_row(size)
+    pub(crate) fn top_row(&self) -> WrappedRow {
+        self.viewport_top_row()
     }
 
-    pub(crate) fn top_pos(&self, size: Size) -> LinePos {
-        pos_of_wrapped_row(&self.lines, size.width, self.viewport_top_row(size))
+    pub(crate) fn top_pos(&self) -> LinePos {
+        let top = self.viewport_top_row();
+        pos_of_wrapped_row_at(
+            self.lines.lines(),
+            self.lines.width(),
+            self.lines.row_counts(),
+            self.lines.total(),
+            top,
+        )
     }
 
-    pub(crate) fn top_line_index(&self, size: Size) -> usize {
+    pub(crate) fn top_line_index(&self) -> usize {
         if self.lines.is_empty() {
             return 0;
         }
-        self.top_pos(size).line
+        self.top_pos().line
     }
 
-    pub(crate) fn bottom_line_index(&self, size: Size) -> usize {
+    pub(crate) fn bottom_line_index(&self) -> usize {
         if self.lines.is_empty() {
             return 0;
         }
-        let body = content_height(size.height.0);
-        let count = visual_row_count(&self.lines, size.width);
-        if count == 0 {
+        let total = self.lines.total();
+        let body = content_height(self.size.height);
+        if total == 0 {
             return 0;
         }
-        let top = self.viewport_top_row(size);
+        let top = self.viewport_top_row();
         let last = if body == 0 {
             top
         } else {
             top.saturating_add(WrappedRow(body - 1))
         };
-        let max_index = WrappedRow::try_from(count - 1).unwrap_or(WrappedRow::MAX);
+        let max_index = WrappedRow::try_from(total - 1).unwrap_or(WrappedRow::MAX);
         let last = cmp::min(last, max_index);
-        logical_line_at_visual_row(&self.lines, size.width, last)
+        line_at_visual_row(self.lines.row_counts(), last)
     }
 
-    pub(crate) fn draw(&mut self, out: &mut impl Write, size: Size) -> io::Result<()> {
-        self.draw_frame(out, size, false)
+    pub(crate) fn draw(&mut self, out: &mut impl Write) -> io::Result<()> {
+        self.draw_frame(out, false)
     }
 
-    pub(crate) fn redraw(&mut self, out: &mut impl Write, size: Size) -> io::Result<()> {
-        self.draw_frame(out, size, true)
+    pub(crate) fn redraw(&mut self, out: &mut impl Write) -> io::Result<()> {
+        self.draw_frame(out, true)
     }
 
-    fn draw_frame(&mut self, out: &mut impl Write, size: Size, force: bool) -> io::Result<()> {
-        if !force && self.body_cache_valid(size) {
+    fn draw_frame(&mut self, out: &mut impl Write, force: bool) -> io::Result<()> {
+        let size = self.size;
+        if !force && self.body_cache_valid() {
             let ruler = match &self.drawn {
                 Some(drawn) => drawn.ruler.clone(),
                 None => String::new(),
             };
-            return self.paint_status(out, size, &ruler);
+            return self.paint_status(out, &ruler);
         }
         let terminal_width = size.width;
-        let body_height = content_height(size.height.0);
-        let total = visual_row_count(&self.lines, terminal_width);
+        let body_height = content_height(size.height);
+        let total = self.lines.total();
         let top = cmp::min(
-            wrapped_row_of_pos(&self.lines, terminal_width, self.pos),
+            wrapped_row_of_pos_at(
+                self.lines.lines(),
+                self.lines.width(),
+                self.lines.row_counts(),
+                self.pos,
+            ),
             max_row(total, body_height),
         );
         let start = cmp::min(top.as_usize(), total);
@@ -259,7 +287,6 @@ impl Renderer {
         };
         let visible = visual_rows_in_range(
             &self.lines,
-            terminal_width,
             self.highlight.as_ref(),
             self.terminal_bg,
             WrappedRow::try_from(start).unwrap_or(WrappedRow::MAX),
@@ -311,17 +338,20 @@ impl Renderer {
         Ok(())
     }
 
-    fn body_cache_valid(&self, size: Size) -> bool {
+    fn body_cache_valid(&self) -> bool {
         match &self.drawn {
             Some(drawn) => {
-                drawn.size == size && drawn.pos == self.pos && drawn.content_gen == self.content_gen
+                drawn.size == self.size
+                    && drawn.pos == self.pos
+                    && drawn.content_gen == self.content_gen
             }
             None => false,
         }
     }
 
     /// Repaint only the status row and cursor. Body rows stay as they are.
-    fn paint_status(&mut self, out: &mut impl Write, size: Size, ruler: &str) -> io::Result<()> {
+    fn paint_status(&mut self, out: &mut impl Write, ruler: &str) -> io::Result<()> {
+        let size = self.size;
         let ruler_cols = display_width(ruler).0.min(size.width.0);
         let label_cols = if ruler_cols == 0 {
             size.width.0
@@ -360,16 +390,29 @@ impl Renderer {
         Ok(())
     }
 
-    fn viewport_top_row(&self, size: Size) -> WrappedRow {
-        let count = visual_row_count(&self.lines, size.width);
-        let row = wrapped_row_of_pos(&self.lines, size.width, self.pos);
-        cmp::min(row, max_row(count, content_height(size.height.0)))
+    fn viewport_top_row(&self) -> WrappedRow {
+        viewport_top_row_at(
+            self.lines.lines(),
+            self.lines.width(),
+            self.lines.row_counts(),
+            self.lines.total(),
+            self.pos,
+            self.size,
+        )
     }
 
-    fn set_top_row(&mut self, row: WrappedRow, size: Size) {
-        let count = visual_row_count(&self.lines, size.width);
-        let row = cmp::min(row, max_row(count, content_height(size.height.0)));
-        self.pos = pos_of_wrapped_row(&self.lines, size.width, row);
+    fn set_top_row(&mut self, row: WrappedRow) {
+        let row = cmp::min(
+            row,
+            max_row(self.lines.total(), content_height(self.size.height)),
+        );
+        self.pos = pos_of_wrapped_row_at(
+            self.lines.lines(),
+            self.lines.width(),
+            self.lines.row_counts(),
+            self.lines.total(),
+            row,
+        );
     }
 
     fn clamp_pos_to_lines(&mut self) {
@@ -380,7 +423,7 @@ impl Renderer {
         if self.pos.line >= self.lines.len() {
             self.pos.line = self.lines.len() - 1;
         }
-        let len = line_byte_len(&self.lines[self.pos.line]);
+        let len = line_byte_len(&self.lines.lines()[self.pos.line]);
         if self.pos.offset > len {
             self.pos.offset = len;
         }
@@ -388,8 +431,8 @@ impl Renderer {
 }
 
 /// Rows available for command output. The last terminal row is the status bar.
-fn content_height(terminal_height: u32) -> u32 {
-    terminal_height.saturating_sub(1)
+fn content_height(terminal_height: Height) -> u32 {
+    terminal_height.0.saturating_sub(1)
 }
 
 fn max_row(visual_row_count: usize, body_height: u32) -> WrappedRow {
@@ -564,40 +607,6 @@ fn slice_cols(s: &str, skip_cols: u32, max_cols: u32) -> String {
     out
 }
 
-fn visual_row_count(lines: &[Line], terminal_width: Width) -> usize {
-    let mut n = 0usize;
-    for line in lines {
-        n = n.saturating_add(line_visual_row_count(line, terminal_width).as_usize());
-    }
-    n
-}
-
-/// Wrapped rows `line` occupies at `terminal_width`.
-/// Matches `line_visual_rows(..., None, ...).len()` without building rows.
-/// A line with no placeable glyph still occupies one row, unless the
-/// terminal width is 0.
-fn line_visual_row_count(line: &Line, terminal_width: Width) -> WrappedRow {
-    if terminal_width == 0 {
-        return WrappedRow(0);
-    }
-    let mut col = Width(0);
-    let mut rows = WrappedRow(1);
-    for span in &line.spans {
-        for ch in span.content.as_ref().chars() {
-            let w = ch.width();
-            if w > terminal_width {
-                continue;
-            }
-            if col + w > terminal_width {
-                rows = rows.saturating_add(WrappedRow(1));
-                col = Width(0);
-            }
-            col += w;
-        }
-    }
-    rows
-}
-
 fn line_byte_len(line: &Line) -> usize {
     let mut n = 0;
     for span in &line.spans {
@@ -606,31 +615,76 @@ fn line_byte_len(line: &Line) -> usize {
     n
 }
 
-fn wrapped_row_of_pos(lines: &[Line], terminal_width: Width, pos: LinePos) -> WrappedRow {
+fn viewport_top_row_at(
+    lines: &[Line],
+    width: Width,
+    row_counts: &[WrappedRow],
+    total: usize,
+    pos: LinePos,
+    size: Size,
+) -> WrappedRow {
+    let row = wrapped_row_of_pos_at(lines, width, row_counts, pos);
+    cmp::min(row, max_row(total, content_height(size.height)))
+}
+
+fn wrapped_row_of_pos_at(
+    lines: &[Line],
+    width: Width,
+    row_counts: &[WrappedRow],
+    pos: LinePos,
+) -> WrappedRow {
     if lines.is_empty() {
         return WrappedRow(0);
     }
     let line_idx = cmp::min(pos.line, lines.len() - 1);
-    let base = visual_row_of_logical_line(lines, terminal_width, line_idx);
-    let offset = visual_row_offset_for_byte(&lines[line_idx], terminal_width, pos.offset);
+    let base = visual_row_of_line(row_counts, line_idx);
+    let offset = visual_row_offset_for_byte(&lines[line_idx], width, pos.offset);
     base.saturating_add(offset)
 }
 
-fn pos_of_wrapped_row(lines: &[Line], terminal_width: Width, row: WrappedRow) -> LinePos {
+fn pos_of_wrapped_row_at(
+    lines: &[Line],
+    width: Width,
+    row_counts: &[WrappedRow],
+    total: usize,
+    row: WrappedRow,
+) -> LinePos {
     if lines.is_empty() {
         return LinePos::default();
     }
-    let count = visual_row_count(lines, terminal_width);
-    if count == 0 {
+    if total == 0 {
         return LinePos::default();
     }
-    let last = WrappedRow::try_from(count - 1).unwrap_or(WrappedRow::MAX);
+    let last = WrappedRow::try_from(total - 1).unwrap_or(WrappedRow::MAX);
     let row = cmp::min(row, last);
-    let line = logical_line_at_visual_row(lines, terminal_width, row);
-    let base = visual_row_of_logical_line(lines, terminal_width, line);
+    let line = line_at_visual_row(row_counts, row);
+    let base = visual_row_of_line(row_counts, line);
     let within = row.saturating_sub(base);
-    let offset = byte_offset_at_wrap_row(&lines[line], terminal_width, within);
+    let offset = byte_offset_at_wrap_row(&lines[line], width, within);
     LinePos { line, offset }
+}
+
+fn visual_row_of_line(row_counts: &[WrappedRow], line_idx: usize) -> WrappedRow {
+    let mut acc = WrappedRow(0);
+    let end = cmp::min(line_idx, row_counts.len());
+    for &n in &row_counts[..end] {
+        acc = acc.saturating_add(n);
+    }
+    acc
+}
+
+fn line_at_visual_row(row_counts: &[WrappedRow], visual_row: WrappedRow) -> usize {
+    let mut acc = WrappedRow(0);
+    for (i, &n) in row_counts.iter().enumerate() {
+        // A blank line still occupies one visual row, so n is at least 1
+        // unless the terminal width is 0 (every count is then 0).
+        let n = cmp::max(n, WrappedRow(1));
+        if visual_row < acc.saturating_add(n) {
+            return i;
+        }
+        acc = acc.saturating_add(n);
+    }
+    row_counts.len().saturating_sub(1)
 }
 
 /// Byte offset of the first character placed on wrap-row `target` of `line`.
@@ -661,38 +715,6 @@ fn byte_offset_at_wrap_row(line: &Line, terminal_width: Width, target: WrappedRo
         }
     }
     byte_off
-}
-
-fn visual_row_of_logical_line(
-    lines: &[Line],
-    terminal_width: Width,
-    line_idx: usize,
-) -> WrappedRow {
-    let mut acc = WrappedRow(0);
-    for line in lines.iter().take(line_idx) {
-        let n = line_visual_row_count(line, terminal_width);
-        acc = acc.saturating_add(n);
-    }
-    acc
-}
-
-fn logical_line_at_visual_row(
-    lines: &[Line],
-    terminal_width: Width,
-    visual_row: WrappedRow,
-) -> usize {
-    let mut acc = WrappedRow(0);
-    for (i, line) in lines.iter().enumerate() {
-        let n = line_visual_row_count(line, terminal_width);
-        // A blank line still occupies one visual row, so n is at least 1
-        // unless the terminal width is 0.
-        let n = cmp::max(n, WrappedRow(1));
-        if visual_row < acc.saturating_add(n) {
-            return i;
-        }
-        acc = acc.saturating_add(n);
-    }
-    lines.len().saturating_sub(1)
 }
 
 fn write_status_bar(out: &mut impl Write, size: Size, status: &str) -> io::Result<()> {
@@ -739,20 +761,20 @@ fn write_one_line(
 /// Lines entirely outside that range are counted, not built.
 /// A line that crosses an edge is built and then trimmed.
 fn visual_rows_in_range(
-    lines: &[Line],
-    terminal_width: Width,
+    lines: &LinesWithWrappedRowCount,
     highlight: Option<&Highlight>,
     terminal_bg: TerminalBg,
     start: WrappedRow,
     end: WrappedRow,
 ) -> Vec<VisualRow> {
     let mut rows = Vec::new();
+    let terminal_width = lines.width();
     if terminal_width == 0 || start >= end {
         return rows;
     }
     let mut acc = WrappedRow(0);
-    for (line_idx, line) in lines.iter().enumerate() {
-        let n = line_visual_row_count(line, terminal_width);
+    for (line_idx, line) in lines.lines().iter().enumerate() {
+        let n = lines.row_counts()[line_idx];
         if n == WrappedRow(0) {
             continue;
         }
@@ -912,11 +934,11 @@ mod tests {
     use std::num::NonZeroU16;
 
     use crate::height::Height;
+    use crate::lines_with_wrapped_row_count::LinesWithWrappedRowCount;
+    use crate::lines_with_wrapped_row_count::line_visual_row_count;
     use crate::render::Renderer;
-    use crate::render::line_visual_row_count;
     use crate::render::line_visual_rows;
     use crate::render::row_fingerprint;
-    use crate::render::visual_row_count;
     use crate::render::visual_rows_in_range;
     use crate::size::Size;
     use crate::terminal::color::TerminalColor;
@@ -952,13 +974,13 @@ mod tests {
 
     fn draw_screen(input: &[u8], width: u16, height: u16, scroll_downs: u32) -> vt100::Parser {
         let size = size(u32::from(width), u32::from(height));
-        let mut renderer = Renderer::new(TerminalBg::Dark);
-        renderer.set_lines(parse_command_output(input), size);
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        renderer.set_lines(parse_command_output(input));
         for _ in 0..scroll_downs {
-            renderer.scroll_down(size);
+            renderer.scroll_down();
         }
         let mut buf = Vec::new();
-        renderer.draw(&mut buf, size).unwrap();
+        renderer.draw(&mut buf).unwrap();
         let mut parser = vt_parser(height, width);
         parser.process(&buf);
         parser
@@ -1036,10 +1058,10 @@ mod tests {
 
     #[test]
     fn test_wrapped_line_is_emitted_as_one_line() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
-        renderer.set_lines(parse_command_output(b"0123456789abcdefghij"), size(10, 5));
+        let mut renderer = Renderer::new(TerminalBg::Dark, size(10, 5));
+        renderer.set_lines(parse_command_output(b"0123456789abcdefghij"));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf, size(10, 5)).unwrap();
+        renderer.draw(&mut buf).unwrap();
         let text = String::from_utf8_lossy(&buf);
         assert_eq!(true, text.contains("0123456789abcdefghij"));
         let content_at = text.find("0123456789abcdefghij").unwrap();
@@ -1077,7 +1099,8 @@ mod tests {
                     );
                     built_total = built_total.saturating_add(built);
                 }
-                assert_eq!(built_total, visual_row_count(&lines, terminal_width));
+                let counted = LinesWithWrappedRowCount::new(lines.clone(), terminal_width);
+                assert_eq!(built_total, counted.total());
                 // A window that starts and ends mid-buffer, including a
                 // window that splits a wrapped line, matches a full build.
                 let total = built_total;
@@ -1095,8 +1118,7 @@ mod tests {
                 let start = total / 3;
                 let end = cmp::min(total, start.saturating_add(cmp::max(1, total / 2)));
                 let sliced = visual_rows_in_range(
-                    &lines,
-                    terminal_width,
+                    &counted,
                     None,
                     TerminalBg::Dark,
                     WrappedRow::try_from(start).unwrap(),
@@ -1122,11 +1144,11 @@ mod tests {
 
     #[test]
     fn test_scroll_top_and_bottom() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
-        renderer.set_lines(parse_command_output(b"a\nb\nc\nd\n"), size(10, 3));
-        renderer.scroll_bottom(size(10, 3));
+        let mut renderer = Renderer::new(TerminalBg::Dark, size(10, 3));
+        renderer.set_lines(parse_command_output(b"a\nb\nc\nd\n"));
+        renderer.scroll_bottom();
         let mut buf = Vec::new();
-        renderer.draw(&mut buf, size(10, 3)).unwrap();
+        renderer.draw(&mut buf).unwrap();
         let mut parser = vt_parser(3, 10);
         parser.process(&buf);
         assert_eq!("c", row_text(&parser, 0, 10));
@@ -1134,31 +1156,28 @@ mod tests {
         assert_eq!("       Bot", row_text(&parser, 2, 10));
         renderer.scroll_top();
         buf.clear();
-        renderer.draw(&mut buf, size(10, 3)).unwrap();
+        renderer.draw(&mut buf).unwrap();
         let mut parser = vt_parser(3, 10);
         parser.process(&buf);
         assert_eq!("a", row_text(&parser, 0, 10));
         assert_eq!("b", row_text(&parser, 1, 10));
         assert_eq!("       Top", row_text(&parser, 2, 10));
-        renderer.scroll_bottom(size(10, 3));
-        let saved = renderer.top_pos(size(10, 3));
+        renderer.scroll_bottom();
+        let saved = renderer.top_pos();
         renderer.scroll_top();
-        renderer.scroll_to_pos(saved, size(10, 3));
-        assert_eq!(saved, renderer.top_pos(size(10, 3)));
+        renderer.scroll_to_pos(saved);
+        assert_eq!(saved, renderer.top_pos());
     }
 
     #[test]
     fn test_scroll_position_follows_text_across_width_change() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
+        let mut renderer = Renderer::new(TerminalBg::Dark, size(5, 3));
         // Width 5 wraps "0123456789abcdefghij" into 01234/56789/abcde/fghij.
-        renderer.set_lines(
-            parse_command_output(b"0123456789abcdefghij\nWXYZ\n"),
-            size(5, 3),
-        );
-        renderer.scroll_down(size(5, 3));
-        renderer.scroll_down(size(5, 3));
+        renderer.set_lines(parse_command_output(b"0123456789abcdefghij\nWXYZ\n"));
+        renderer.scroll_down();
+        renderer.scroll_down();
         let mut buf = Vec::new();
-        renderer.draw(&mut buf, size(5, 3)).unwrap();
+        renderer.draw(&mut buf).unwrap();
         let mut parser = vt_parser(3, 5);
         parser.process(&buf);
         assert_eq!("abcde", row_text(&parser, 0, 5));
@@ -1166,7 +1185,8 @@ mod tests {
         // ('a') sits on "89abcdef". A stale wrapped-row index of 2 would
         // show "ghij" instead.
         buf.clear();
-        renderer.draw(&mut buf, size(8, 3)).unwrap();
+        renderer.update_size(size(8, 3));
+        renderer.draw(&mut buf).unwrap();
         let mut parser = vt_parser(3, 8);
         parser.process(&buf);
         assert_eq!("89abcdef", row_text(&parser, 0, 8));
@@ -1174,19 +1194,19 @@ mod tests {
 
     #[test]
     fn test_scroll_page_down_and_up() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
-        renderer.set_lines(parse_command_output(b"a\nb\nc\nd\ne\nf\n"), size(10, 3));
-        renderer.scroll_page_down(size(10, 3));
+        let mut renderer = Renderer::new(TerminalBg::Dark, size(10, 3));
+        renderer.set_lines(parse_command_output(b"a\nb\nc\nd\ne\nf\n"));
+        renderer.scroll_page_down();
         let mut buf = Vec::new();
-        renderer.draw(&mut buf, size(10, 3)).unwrap();
+        renderer.draw(&mut buf).unwrap();
         let mut parser = vt_parser(3, 10);
         parser.process(&buf);
         assert_eq!("c", row_text(&parser, 0, 10));
         assert_eq!("d", row_text(&parser, 1, 10));
         assert_eq!("       66%", row_text(&parser, 2, 10));
-        renderer.scroll_page_up(size(10, 3));
+        renderer.scroll_page_up();
         buf.clear();
-        renderer.draw(&mut buf, size(10, 3)).unwrap();
+        renderer.draw(&mut buf).unwrap();
         let mut parser = vt_parser(3, 10);
         parser.process(&buf);
         assert_eq!("a", row_text(&parser, 0, 10));
@@ -1230,62 +1250,59 @@ mod tests {
 
     #[test]
     fn test_draw_skips_when_visible_unchanged() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
-        renderer.set_lines(parse_command_output(b"a\nb\nc\n"), size(10, 2));
+        let mut renderer = Renderer::new(TerminalBg::Dark, size(10, 2));
+        renderer.set_lines(parse_command_output(b"a\nb\nc\n"));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf, size(10, 2)).unwrap();
+        renderer.draw(&mut buf).unwrap();
         assert_eq!(false, buf.is_empty());
         buf.clear();
-        renderer.draw(&mut buf, size(10, 2)).unwrap();
+        renderer.draw(&mut buf).unwrap();
         assert_eq!(true, buf.is_empty());
     }
 
     #[test]
     fn test_draw_skips_when_change_is_below_visible_area() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
-        renderer.set_lines(parse_command_output(b"a\nb\nc\n"), size(10, 3));
+        let mut renderer = Renderer::new(TerminalBg::Dark, size(10, 3));
+        renderer.set_lines(parse_command_output(b"a\nb\nc\n"));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf, size(10, 3)).unwrap();
+        renderer.draw(&mut buf).unwrap();
         buf.clear();
-        renderer.set_lines(parse_command_output(b"a\nb\nX\n"), size(10, 3));
-        renderer.draw(&mut buf, size(10, 3)).unwrap();
+        renderer.set_lines(parse_command_output(b"a\nb\nX\n"));
+        renderer.draw(&mut buf).unwrap();
         assert_eq!(true, buf.is_empty());
     }
 
     #[test]
     fn test_draw_writes_when_visible_area_changes() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
-        renderer.set_lines(parse_command_output(b"a\nb\nc\n"), size(10, 3));
+        let mut renderer = Renderer::new(TerminalBg::Dark, size(10, 3));
+        renderer.set_lines(parse_command_output(b"a\nb\nc\n"));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf, size(10, 3)).unwrap();
+        renderer.draw(&mut buf).unwrap();
         buf.clear();
-        renderer.set_lines(parse_command_output(b"a\nB\nc\n"), size(10, 3));
-        renderer.draw(&mut buf, size(10, 3)).unwrap();
+        renderer.set_lines(parse_command_output(b"a\nB\nc\n"));
+        renderer.draw(&mut buf).unwrap();
         assert_eq!(false, buf.is_empty());
     }
 
     #[test]
     fn test_redraw_writes_when_visible_unchanged() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
-        renderer.set_lines(parse_command_output(b"a\nb\n"), size(10, 2));
+        let mut renderer = Renderer::new(TerminalBg::Dark, size(10, 2));
+        renderer.set_lines(parse_command_output(b"a\nb\n"));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf, size(10, 2)).unwrap();
+        renderer.draw(&mut buf).unwrap();
         buf.clear();
-        renderer.redraw(&mut buf, size(10, 2)).unwrap();
+        renderer.redraw(&mut buf).unwrap();
         assert_eq!(false, buf.is_empty());
     }
 
     #[test]
     fn test_search_highlight_sets_bg() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = size(20, 3);
-        renderer.set_lines(
-            parse_command_output(b"xxFOOyy\na\x1b[31mFOO\x1b[0mb\n"),
-            size,
-        );
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        renderer.set_lines(parse_command_output(b"xxFOOyy\na\x1b[31mFOO\x1b[0mb\n"));
         renderer.set_highlight(Some("FOO".to_owned()), Some((0, 2)), false);
         let mut buf = Vec::new();
-        renderer.draw(&mut buf, size).unwrap();
+        renderer.draw(&mut buf).unwrap();
         let mut parser = vt_parser(3, 20);
         parser.process(&buf);
         assert_eq!("xxFOOyy", row_text(&parser, 0, 20));
@@ -1342,10 +1359,10 @@ mod tests {
 
     #[test]
     fn test_status_bar_light_grey_on_light_bg() {
-        let mut renderer = Renderer::new(TerminalBg::Light);
-        renderer.set_lines(parse_command_output(b"a\n"), size(10, 2));
+        let mut renderer = Renderer::new(TerminalBg::Light, size(10, 2));
+        renderer.set_lines(parse_command_output(b"a\n"));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf, size(10, 2)).unwrap();
+        renderer.draw(&mut buf).unwrap();
         let mut parser = vt_parser(2, 10);
         parser.process(&buf);
         assert_eq!("       Bot", row_text(&parser, 1, 10));
@@ -1357,15 +1374,15 @@ mod tests {
 
     #[test]
     fn test_status_update_does_not_repaint_body() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = size(10, 3);
-        renderer.set_lines(parse_command_output(b"a\nb\nc\nd\n"), size);
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        renderer.set_lines(parse_command_output(b"a\nb\nc\nd\n"));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf, size).unwrap();
+        renderer.draw(&mut buf).unwrap();
         assert_eq!(true, buf.windows(4).any(|w| w == b"\x1b[2J"));
         buf.clear();
         renderer.set_prompt_status("/hi".to_owned(), 3);
-        renderer.draw(&mut buf, size).unwrap();
+        renderer.draw(&mut buf).unwrap();
         assert_eq!(false, buf.is_empty());
         assert_eq!(false, buf.windows(4).any(|w| w == b"\x1b[2J"));
         assert_eq!(true, buf.windows(3).any(|w| w == b"/hi"));
@@ -1373,13 +1390,13 @@ mod tests {
 
     #[test]
     fn test_draw_writes_when_end_indicator_appears() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
-        renderer.set_lines(parse_command_output(b"a\nb\nc\n"), size(10, 3));
+        let mut renderer = Renderer::new(TerminalBg::Dark, size(10, 3));
+        renderer.set_lines(parse_command_output(b"a\nb\nc\n"));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf, size(10, 3)).unwrap();
+        renderer.draw(&mut buf).unwrap();
         buf.clear();
-        renderer.set_lines(parse_command_output(b"a\nb\n"), size(10, 3));
-        renderer.draw(&mut buf, size(10, 3)).unwrap();
+        renderer.set_lines(parse_command_output(b"a\nb\n"));
+        renderer.draw(&mut buf).unwrap();
         assert_eq!(false, buf.is_empty());
     }
 }

@@ -91,14 +91,14 @@ mod tests {
 
     #[test]
     fn test_help_draws_key_list() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = Size {
             width: Width(80),
             height: Height(30),
         };
-        renderer.set_lines(help_lines(), size);
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        renderer.set_lines(help_lines());
         let mut buf = Vec::new();
-        renderer.draw(&mut buf, size).unwrap();
+        renderer.draw(&mut buf).unwrap();
         let mut parser = vt_parser(30, 80);
         parser.process(&buf);
         assert_eq!(true, parser.screen().contents().contains("Show this help"));

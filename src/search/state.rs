@@ -270,15 +270,15 @@ mod tests {
 
     #[test]
     fn test_ignore_case_matches_unless_pattern_has_uppercase() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = size(10, 6);
-        renderer.set_lines(parse_command_output(b"FOO\nfoo\nFoo\nbar\n"), size);
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        renderer.set_lines(parse_command_output(b"FOO\nfoo\nFoo\nbar\n"));
         let mut search = Search::new();
         search.toggle_ignore_case();
         assert_eq!(CaseMode::IgnoreCase, search.case_mode());
         assert_eq!(
             SearchOutcome::Found,
-            submit_prompt(&mut renderer, &mut search, size, true, "foo".to_owned())
+            submit_prompt(&mut renderer, &mut search, true, "foo".to_owned())
         );
         assert_eq!(
             Some("[1/3]".to_owned()),
@@ -287,7 +287,7 @@ mod tests {
         // less -i: a pattern with uppercase is matched case-sensitively.
         assert_eq!(
             SearchOutcome::Found,
-            submit_prompt(&mut renderer, &mut search, size, true, "Foo".to_owned())
+            submit_prompt(&mut renderer, &mut search, true, "Foo".to_owned())
         );
         assert_eq!(
             Some("[1/1]".to_owned()),
@@ -298,7 +298,7 @@ mod tests {
         assert_eq!(CaseMode::IgnoreCaseAlways, search.case_mode());
         assert_eq!(
             SearchOutcome::Found,
-            submit_prompt(&mut renderer, &mut search, size, true, "Foo".to_owned())
+            submit_prompt(&mut renderer, &mut search, true, "Foo".to_owned())
         );
         assert_eq!(
             Some("[1/3]".to_owned()),
@@ -309,13 +309,13 @@ mod tests {
 
     #[test]
     fn test_toggle_ignore_case_refreshes_hits() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = size(10, 6);
-        renderer.set_lines(parse_command_output(b"FOO\nfoo\nFoo\nbar\n"), size);
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        renderer.set_lines(parse_command_output(b"FOO\nfoo\nFoo\nbar\n"));
         let mut search = Search::new();
         assert_eq!(
             SearchOutcome::Found,
-            submit_prompt(&mut renderer, &mut search, size, true, "foo".to_owned())
+            submit_prompt(&mut renderer, &mut search, true, "foo".to_owned())
         );
         assert_eq!(
             Some("[1/1]".to_owned()),
@@ -336,7 +336,7 @@ mod tests {
                 .status(search.match_label(renderer.lines()).as_deref())
         );
         let mut buf = Vec::new();
-        renderer.redraw(&mut buf, size).unwrap();
+        renderer.redraw(&mut buf).unwrap();
         let mut parser =
             vt100::Parser::new(NonZeroU16::new(6).unwrap(), NonZeroU16::new(10).unwrap(), 0);
         parser.process(&buf);
@@ -347,15 +347,12 @@ mod tests {
 
     #[test]
     fn test_reattach_keeps_current_across_refresh() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = size(20, 8);
-        renderer.set_lines(
-            parse_command_output(b"foo foo\nbar\nfoo\nx\nx\nx\nx\nx\n"),
-            size,
-        );
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        renderer.set_lines(parse_command_output(b"foo foo\nbar\nfoo\nx\nx\nx\nx\nx\n"));
         let mut search = Search::new();
-        submit_prompt(&mut renderer, &mut search, size, true, "foo".to_owned());
-        search_next(&mut renderer, &mut search, size, false);
+        submit_prompt(&mut renderer, &mut search, true, "foo".to_owned());
+        search_next(&mut renderer, &mut search, false);
         assert_eq!(
             Some("[2/3]".to_owned()),
             search.match_label(renderer.lines())
@@ -416,18 +413,17 @@ mod tests {
 
     #[test]
     fn test_toggle_ignore_case_selects_visible_hit() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
+        let size = size(10, 6);
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
         // Height 6 → 5 body rows. 12 lines, so the last page starts at line 7
         // and does not include the line-0 "foo".
-        let size = size(10, 6);
-        renderer.set_lines(
-            parse_command_output(b"foo\nx\nx\nx\nx\nx\nx\nx\nx\nx\nFOO\nfoo\n"),
-            size,
-        );
+        renderer.set_lines(parse_command_output(
+            b"foo\nx\nx\nx\nx\nx\nx\nx\nx\nx\nFOO\nfoo\n",
+        ));
         let mut search = Search::new();
         assert_eq!(
             SearchOutcome::Found,
-            submit_prompt(&mut renderer, &mut search, size, true, "foo".to_owned())
+            submit_prompt(&mut renderer, &mut search, true, "foo".to_owned())
         );
         assert_eq!(
             Some("[1/2]".to_owned()),
@@ -435,15 +431,16 @@ mod tests {
         );
         // A move drops the selected hit. -i must still adopt a visible hit
         // under the new case mode, without scrolling.
-        renderer.scroll_bottom(size);
+        renderer.scroll_bottom();
         search.clear_match();
-        let top = renderer.top_line_index(size);
+        let top = renderer.top_line_index();
         assert_eq!(7, top);
         search.toggle_ignore_case();
         search.reattach(renderer.lines(), None);
-        search.select_visible_match(renderer.lines(), top, renderer.bottom_line_index(size));
+        let bottom = renderer.bottom_line_index();
+        search.select_visible_match(renderer.lines(), top, bottom);
         search.apply_highlight(&mut renderer);
-        assert_eq!(7, renderer.top_line_index(size));
+        assert_eq!(7, renderer.top_line_index());
         // Visible ignore-case hits are line 10 "FOO" and line 11 "foo".
         // All hits are foo, FOO, foo → the on-screen FOO is [2/3].
         assert_eq!(

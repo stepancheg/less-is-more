@@ -285,12 +285,12 @@ mod tests {
 
     #[test]
     fn test_status_bar_shows_prompt() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = size(10, 3);
-        renderer.set_lines(parse_command_output(b"a\nb\nc\nd\n"), size);
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        renderer.set_lines(parse_command_output(b"a\nb\nc\nd\n"));
         renderer.set_status_label(Some("/foo".to_owned()));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf, size).unwrap();
+        renderer.draw(&mut buf).unwrap();
         let mut parser = vt_parser(3, 10);
         parser.process(&buf);
         let mut text = String::new();

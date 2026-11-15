@@ -67,8 +67,8 @@ pub(crate) struct EventLoop {
 impl EventLoop {
     pub(crate) fn new(terminal_bg: TerminalBg, history: History, size: Size) -> EventLoop {
         EventLoop {
-            renderer: Renderer::new(terminal_bg),
-            help_renderer: Renderer::new(terminal_bg),
+            renderer: Renderer::new(terminal_bg, size),
+            help_renderer: Renderer::new(terminal_bg, size),
             search: Search::new(),
             history,
             marks: Marks::default(),
@@ -148,10 +148,12 @@ impl EventLoop {
             width: Width(u32::from(cols)),
             height: Height(u32::from(rows)),
         };
+        self.renderer.update_size(self.size);
+        self.help_renderer.update_size(self.size);
         if matches!(self.mode, Mode::Help) {
-            self.help_renderer.redraw(&mut io::stdout(), self.size)?;
+            self.help_renderer.redraw(&mut io::stdout())?;
         } else {
-            self.renderer.redraw(&mut io::stdout(), self.size)?;
+            self.renderer.redraw(&mut io::stdout())?;
         }
         Ok(())
     }
@@ -162,9 +164,8 @@ impl EventLoop {
     }
 
     fn on_command_output(&mut self, lines: Vec<Line>) -> anyhow::Result<()> {
-        let size = self.size;
         let anchor = self.search.anchor(self.renderer.lines());
-        self.renderer.set_lines(lines, size);
+        self.renderer.set_lines(lines);
         self.search.reattach(self.renderer.lines(), anchor);
         self.search.apply_highlight(&mut self.renderer);
         if !matches!(self.mode, Mode::Prompt(_) | Mode::Dash | Mode::Mark(_)) {
@@ -175,7 +176,7 @@ impl EventLoop {
             self.renderer.set_status_label(label);
         }
         if !matches!(self.mode, Mode::Help) {
-            self.renderer.draw(&mut io::stdout(), size)?;
+            self.renderer.draw(&mut io::stdout())?;
         }
         Ok(())
     }
@@ -198,7 +199,6 @@ impl EventLoop {
 
     fn on_dash_key(&mut self, key: KeyEvent) -> anyhow::Result<KeyResult> {
         self.mode = Mode::Output;
-        let size = self.size;
         let option = match key.code {
             KeyCode::Char('i') if !key.modifiers.contains(KeyModifiers::CONTROL) => Some(false),
             KeyCode::Char('I') if !key.modifiers.contains(KeyModifiers::CONTROL) => Some(true),
@@ -212,8 +212,8 @@ impl EventLoop {
                 self.search.toggle_ignore_case();
             }
             self.search.reattach(self.renderer.lines(), anchor);
-            let top_line = self.renderer.top_line_index(size);
-            let bottom_line = self.renderer.bottom_line_index(size);
+            let top_line = self.renderer.top_line_index();
+            let bottom_line = self.renderer.bottom_line_index();
             self.search
                 .select_visible_match(self.renderer.lines(), top_line, bottom_line);
             self.search.apply_highlight(&mut self.renderer);
@@ -222,18 +222,17 @@ impl EventLoop {
                 .case_mode()
                 .status(self.search.match_label(self.renderer.lines()).as_deref());
             self.renderer.set_status_label(Some(status));
-            self.renderer.redraw(&mut io::stdout(), size)?;
+            self.renderer.redraw(&mut io::stdout())?;
             return Ok(KeyResult::Continue);
         }
         // Unknown option or cancel: drop the `-` prompt.
         let label = self.search.match_label(self.renderer.lines());
         self.renderer.set_status_label(label);
-        self.renderer.redraw(&mut io::stdout(), size)?;
+        self.renderer.redraw(&mut io::stdout())?;
         Ok(KeyResult::Continue)
     }
 
     fn on_paste(&mut self, text: &str) -> anyhow::Result<()> {
-        let size = self.size;
         let mut prompt = match mem::replace(&mut self.mode, Mode::Output) {
             Mode::Prompt(prompt) => prompt,
             other => {
@@ -245,7 +244,7 @@ impl EventLoop {
             self.renderer
                 .set_prompt_status(prompt.status_label(), prompt.caret_cols());
             self.mode = Mode::Prompt(prompt);
-            self.renderer.draw(&mut io::stdout(), size)?;
+            self.renderer.draw(&mut io::stdout())?;
         } else {
             self.mode = Mode::Prompt(prompt);
         }
@@ -253,7 +252,6 @@ impl EventLoop {
     }
 
     fn on_prompt_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
-        let size = self.size;
         let mut prompt = match mem::replace(&mut self.mode, Mode::Output) {
             Mode::Prompt(prompt) => prompt,
             other => {
@@ -266,11 +264,11 @@ impl EventLoop {
                 self.renderer
                     .set_prompt_status(prompt.status_label(), prompt.caret_cols());
                 self.mode = Mode::Prompt(prompt);
-                self.renderer.draw(&mut io::stdout(), size)?;
+                self.renderer.draw(&mut io::stdout())?;
             }
             PromptOutcome::Redraw => {
                 self.mode = Mode::Prompt(prompt);
-                self.renderer.redraw(&mut io::stdout(), size)?;
+                self.renderer.redraw(&mut io::stdout())?;
             }
             PromptOutcome::Ignore => {
                 self.mode = Mode::Prompt(prompt);
@@ -278,7 +276,7 @@ impl EventLoop {
             PromptOutcome::Cancel => {
                 let label = self.search.match_label(self.renderer.lines());
                 self.renderer.set_status_label(label);
-                self.renderer.redraw(&mut io::stdout(), size)?;
+                self.renderer.redraw(&mut io::stdout())?;
             }
             PromptOutcome::Submit => {
                 let forward = prompt.forward();
@@ -296,26 +294,23 @@ impl EventLoop {
                         self.history.record(&query);
                     }
                 }
-                let outcome =
-                    submit_prompt(&mut self.renderer, &mut self.search, size, forward, query);
-                show_search_outcome(&mut self.renderer, &self.search, outcome, size)?;
+                let outcome = submit_prompt(&mut self.renderer, &mut self.search, forward, query);
+                show_search_outcome(&mut self.renderer, &self.search, outcome)?;
             }
         }
         Ok(())
     }
 
     fn begin_mark(&mut self, op: MarkOp) -> anyhow::Result<KeyResult> {
-        let size = self.size;
         self.mode = Mode::Mark(op);
         self.renderer
             .set_status_label(Some(op.prompt_label().to_owned()));
-        self.renderer.redraw(&mut io::stdout(), size)?;
+        self.renderer.redraw(&mut io::stdout())?;
         Ok(KeyResult::Continue)
     }
 
     fn on_mark_key(&mut self, key: KeyEvent, op: MarkOp) -> anyhow::Result<KeyResult> {
         self.mode = Mode::Output;
-        let size = self.size;
         let name = match key.code {
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -326,28 +321,28 @@ impl EventLoop {
             _ => {
                 let label = self.search.match_label(self.renderer.lines());
                 self.renderer.set_status_label(label);
-                self.renderer.redraw(&mut io::stdout(), size)?;
+                self.renderer.redraw(&mut io::stdout())?;
                 return Ok(KeyResult::Continue);
             }
         };
         match op {
             MarkOp::Set => {
-                self.marks.rows.insert(name, self.renderer.top_pos(size));
+                self.marks.rows.insert(name, self.renderer.top_pos());
                 let label = self.search.match_label(self.renderer.lines());
                 self.renderer.set_status_label(label);
-                self.renderer.redraw(&mut io::stdout(), size)?;
+                self.renderer.redraw(&mut io::stdout())?;
             }
             MarkOp::Goto => {
                 let Some(pos) = self.marks.rows.get(&name).copied() else {
                     self.renderer.set_status_label(Some(NOT_SET.to_owned()));
-                    self.renderer.redraw(&mut io::stdout(), size)?;
+                    self.renderer.redraw(&mut io::stdout())?;
                     return Ok(KeyResult::Continue);
                 };
                 self.search.clear_match();
                 self.search.apply_highlight(&mut self.renderer);
                 self.renderer.set_status_label(None);
-                self.renderer.scroll_to_pos(pos, size);
-                self.renderer.redraw(&mut io::stdout(), size)?;
+                self.renderer.scroll_to_pos(pos);
+                self.renderer.redraw(&mut io::stdout())?;
             }
         }
         Ok(KeyResult::Continue)
@@ -360,8 +355,7 @@ impl EventLoop {
         match action {
             KeyAction::Quit | KeyAction::Help => {
                 self.mode = Mode::Output;
-                let size = self.size;
-                self.renderer.redraw(&mut io::stdout(), size)?;
+                self.renderer.redraw(&mut io::stdout())?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::DismissMessage => {
@@ -389,7 +383,7 @@ impl EventLoop {
             | KeyAction::ScrollBottom
             | KeyAction::ScrollPageDown
             | KeyAction::ScrollPageUp) => {
-                apply_view_action(&mut self.help_renderer, action, self.size)?;
+                apply_view_action(&mut self.help_renderer, action)?;
                 Ok(KeyResult::Continue)
             }
         }
@@ -401,10 +395,9 @@ impl EventLoop {
         };
         match action {
             KeyAction::Dash => {
-                let size = self.size;
                 self.mode = Mode::Dash;
                 self.renderer.set_status_label(Some("-".to_owned()));
-                self.renderer.redraw(&mut io::stdout(), size)?;
+                self.renderer.redraw(&mut io::stdout())?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::DismissMessage => {
@@ -414,40 +407,36 @@ impl EventLoop {
                 if !is_dismissable_status(status) {
                     return Ok(KeyResult::Continue);
                 }
-                let size = self.size;
                 let label = self.search.match_label(self.renderer.lines());
                 self.renderer.set_status_label(label);
-                self.renderer.redraw(&mut io::stdout(), size)?;
+                self.renderer.redraw(&mut io::stdout())?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::Quit => Ok(KeyResult::Quit),
             KeyAction::Help => {
-                let size = self.size;
                 self.mode = Mode::Help;
-                self.help_renderer.set_lines(help_lines(), size);
+                self.help_renderer.set_lines(help_lines());
                 self.help_renderer.scroll_top();
-                self.help_renderer.redraw(&mut io::stdout(), size)?;
+                self.help_renderer.redraw(&mut io::stdout())?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::Refresh => Ok(KeyResult::Refresh),
             KeyAction::SearchForward | KeyAction::SearchBackward => {
-                let size = self.size;
                 let forward = matches!(action, KeyAction::SearchForward);
                 let prompt = Prompt::new(forward);
                 self.renderer
                     .set_prompt_status(prompt.status_label(), prompt.caret_cols());
                 self.mode = Mode::Prompt(prompt);
-                self.renderer.draw(&mut io::stdout(), size)?;
+                self.renderer.draw(&mut io::stdout())?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::SetMark => self.begin_mark(MarkOp::Set),
             KeyAction::GotoMark => self.begin_mark(MarkOp::Goto),
             KeyAction::SearchNext | KeyAction::SearchPrev => {
-                let size = self.size;
                 let reverse = matches!(action, KeyAction::SearchPrev);
                 self.resume_search_pattern();
-                let outcome = search_next(&mut self.renderer, &mut self.search, size, reverse);
-                show_search_outcome(&mut self.renderer, &self.search, outcome, size)?;
+                let outcome = search_next(&mut self.renderer, &mut self.search, reverse);
+                show_search_outcome(&mut self.renderer, &self.search, outcome)?;
                 Ok(KeyResult::Continue)
             }
             action @ (KeyAction::ScrollDown
@@ -464,7 +453,7 @@ impl EventLoop {
                     self.search.apply_highlight(&mut self.renderer);
                     self.renderer.set_status_label(None);
                 }
-                apply_view_action(&mut self.renderer, action, self.size)?;
+                apply_view_action(&mut self.renderer, action)?;
                 Ok(KeyResult::Continue)
             }
         }
@@ -475,7 +464,6 @@ fn show_search_outcome(
     renderer: &mut Renderer,
     search: &Search,
     outcome: SearchOutcome,
-    size: Size,
 ) -> anyhow::Result<()> {
     match outcome {
         SearchOutcome::Found => {
@@ -499,38 +487,38 @@ fn show_search_outcome(
             renderer.set_status_label(Some(INVALID_PATTERN.to_owned()));
         }
     }
-    renderer.redraw(&mut io::stdout(), size)?;
+    renderer.redraw(&mut io::stdout())?;
     Ok(())
 }
 
-fn apply_view_action(view: &mut Renderer, action: KeyAction, size: Size) -> anyhow::Result<()> {
+fn apply_view_action(view: &mut Renderer, action: KeyAction) -> anyhow::Result<()> {
     match action {
         KeyAction::ScrollDown => {
-            view.scroll_down(size);
-            view.draw(&mut io::stdout(), size)?;
+            view.scroll_down();
+            view.draw(&mut io::stdout())?;
         }
         KeyAction::ScrollUp => {
-            view.scroll_up(size);
-            view.draw(&mut io::stdout(), size)?;
+            view.scroll_up();
+            view.draw(&mut io::stdout())?;
         }
         KeyAction::Redraw => {
-            view.redraw(&mut io::stdout(), size)?;
+            view.redraw(&mut io::stdout())?;
         }
         KeyAction::ScrollTop => {
             view.scroll_top();
-            view.draw(&mut io::stdout(), size)?;
+            view.draw(&mut io::stdout())?;
         }
         KeyAction::ScrollBottom => {
-            view.scroll_bottom(size);
-            view.draw(&mut io::stdout(), size)?;
+            view.scroll_bottom();
+            view.draw(&mut io::stdout())?;
         }
         KeyAction::ScrollPageDown => {
-            view.scroll_page_down(size);
-            view.draw(&mut io::stdout(), size)?;
+            view.scroll_page_down();
+            view.draw(&mut io::stdout())?;
         }
         KeyAction::ScrollPageUp => {
-            view.scroll_page_up(size);
-            view.draw(&mut io::stdout(), size)?;
+            view.scroll_page_up();
+            view.draw(&mut io::stdout())?;
         }
         KeyAction::Quit
         | KeyAction::Help

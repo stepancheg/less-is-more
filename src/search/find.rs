@@ -1,7 +1,6 @@
 use crate::render::Renderer;
 use crate::search::state::CaseMode;
 use crate::search::state::Search;
-use crate::size::Size;
 use crate::terminal::line::Line;
 use crate::terminal::line::compile_search;
 use crate::terminal::line::fold_case;
@@ -26,7 +25,6 @@ pub(crate) struct Occurrence {
 pub(crate) fn run_search(
     renderer: &mut Renderer,
     search: &mut Search,
-    size: Size,
     forward: bool,
     repeat: bool,
 ) -> SearchOutcome {
@@ -43,13 +41,13 @@ pub(crate) fn run_search(
         }
     };
     let occs = occurrences_with(renderer.lines(), &re);
-    let picked = pick_occurrence(renderer, search, size, &occs, forward, repeat);
+    let picked = pick_occurrence(renderer, search, &occs, forward, repeat);
     match picked {
         Some(idx) => {
             let occ = occs[idx];
             search.current = Some((occ.line, occ.byte_start));
             search.apply_highlight(renderer);
-            renderer.scroll_to_match(occ.line, occ.byte_start, size);
+            renderer.scroll_to_match(occ.line, occ.byte_start);
             SearchOutcome::Found
         }
         None => {
@@ -66,7 +64,6 @@ pub(crate) fn run_search(
 pub(crate) fn submit_prompt(
     renderer: &mut Renderer,
     search: &mut Search,
-    size: Size,
     forward: bool,
     query: String,
 ) -> SearchOutcome {
@@ -88,13 +85,12 @@ pub(crate) fn submit_prompt(
         search.pattern = query;
     }
     search.forward = forward;
-    run_search(renderer, search, size, forward, false)
+    run_search(renderer, search, forward, false)
 }
 
 pub(crate) fn search_next(
     renderer: &mut Renderer,
     search: &mut Search,
-    size: Size,
     reverse: bool,
 ) -> SearchOutcome {
     let forward = if reverse {
@@ -102,7 +98,7 @@ pub(crate) fn search_next(
     } else {
         search.forward
     };
-    run_search(renderer, search, size, forward, true)
+    run_search(renderer, search, forward, true)
 }
 
 pub(crate) fn occurrences(lines: &[Line], pattern: &str, ignore_case: bool) -> Vec<Occurrence> {
@@ -128,7 +124,6 @@ fn occurrences_with(lines: &[Line], re: &regex::Regex) -> Vec<Occurrence> {
 fn pick_occurrence(
     renderer: &Renderer,
     search: &Search,
-    size: Size,
     occs: &[Occurrence],
     forward: bool,
     repeat: bool,
@@ -148,10 +143,10 @@ fn pick_occurrence(
         }
     }
     if forward {
-        let top = renderer.top_line_index(size);
+        let top = renderer.top_line_index();
         occs.iter().position(|occ| occ.line >= top)
     } else {
-        let bottom = renderer.bottom_line_index(size);
+        let bottom = renderer.bottom_line_index();
         occs.iter().rposition(|occ| occ.line <= bottom)
     }
 }
@@ -242,9 +237,9 @@ mod tests {
         }
     }
 
-    fn assert_line_visible(renderer: &Renderer, size: Size, line: usize) {
-        let top = renderer.top_line_index(size);
-        let bottom = renderer.bottom_line_index(size);
+    fn assert_line_visible(renderer: &Renderer, line: usize) {
+        let top = renderer.top_line_index();
+        let bottom = renderer.bottom_line_index();
         assert_eq!(true, line >= top && line <= bottom);
     }
 
@@ -276,17 +271,17 @@ mod tests {
 
     #[test]
     fn test_invalid_pattern() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = size(10, 4);
-        renderer.set_lines(parse_command_output(b"foo\n"), size);
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        renderer.set_lines(parse_command_output(b"foo\n"));
         let mut search = Search::new();
         assert_eq!(
             SearchOutcome::Found,
-            submit_prompt(&mut renderer, &mut search, size, true, "foo".to_owned())
+            submit_prompt(&mut renderer, &mut search, true, "foo".to_owned())
         );
         assert_eq!(
             SearchOutcome::InvalidPattern,
-            submit_prompt(&mut renderer, &mut search, size, true, "[".to_owned())
+            submit_prompt(&mut renderer, &mut search, true, "[".to_owned())
         );
         // Previous pattern is kept.
         assert_eq!("foo", search.pattern);
@@ -305,92 +300,83 @@ mod tests {
 
     #[test]
     fn test_submit_scrolls_to_match() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = size(10, 4);
-        renderer.set_lines(
-            parse_command_output(b"a\nb\nc\nd\nTARGET\nf\ng\nh\ni\n"),
-            size,
-        );
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        renderer.set_lines(parse_command_output(b"a\nb\nc\nd\nTARGET\nf\ng\nh\ni\n"));
         let mut search = Search::new();
-        let outcome = submit_prompt(&mut renderer, &mut search, size, true, "TARGET".to_owned());
+        let outcome = submit_prompt(&mut renderer, &mut search, true, "TARGET".to_owned());
         assert_eq!(SearchOutcome::Found, outcome);
-        assert_line_visible(&renderer, size, 4);
+        assert_line_visible(&renderer, 4);
     }
 
     #[test]
     fn test_submit_backward_scrolls_to_match() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = size(10, 4);
-        renderer.set_lines(parse_command_output(b"TARGET\nb\nc\nd\ne\nf\n"), size);
-        renderer.scroll_bottom(size);
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        renderer.set_lines(parse_command_output(b"TARGET\nb\nc\nd\ne\nf\n"));
+        renderer.scroll_bottom();
         let mut search = Search::new();
-        let outcome = submit_prompt(&mut renderer, &mut search, size, false, "TARGET".to_owned());
+        let outcome = submit_prompt(&mut renderer, &mut search, false, "TARGET".to_owned());
         assert_eq!(SearchOutcome::Found, outcome);
-        assert_eq!(0, renderer.top_line_index(size));
+        assert_eq!(0, renderer.top_line_index());
     }
 
     #[test]
     fn test_search_next_moves_to_following_match() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = size(10, 3);
-        renderer.set_lines(
-            parse_command_output(b"hit\na\nhit\nb\nhit\nx\nx\nx\n"),
-            size,
-        );
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        renderer.set_lines(parse_command_output(b"hit\na\nhit\nb\nhit\nx\nx\nx\n"));
         let mut search = Search::new();
         assert_eq!(
             SearchOutcome::Found,
-            submit_prompt(&mut renderer, &mut search, size, true, "hit".to_owned())
+            submit_prompt(&mut renderer, &mut search, true, "hit".to_owned())
         );
-        assert_eq!(0, renderer.top_line_index(size));
+        assert_eq!(0, renderer.top_line_index());
         assert_eq!(
             SearchOutcome::Found,
-            search_next(&mut renderer, &mut search, size, false)
+            search_next(&mut renderer, &mut search, false)
         );
-        assert_line_visible(&renderer, size, 2);
+        assert_line_visible(&renderer, 2);
         assert_eq!(
             SearchOutcome::Found,
-            search_next(&mut renderer, &mut search, size, false)
+            search_next(&mut renderer, &mut search, false)
         );
-        assert_line_visible(&renderer, size, 4);
-        let top_at_third = renderer.top_line_index(size);
+        assert_line_visible(&renderer, 4);
+        let top_at_third = renderer.top_line_index();
         assert_eq!(
             SearchOutcome::NotFound,
-            search_next(&mut renderer, &mut search, size, false)
+            search_next(&mut renderer, &mut search, false)
         );
-        assert_eq!(top_at_third, renderer.top_line_index(size));
+        assert_eq!(top_at_third, renderer.top_line_index());
         assert_eq!(
             SearchOutcome::NotFound,
-            search_next(&mut renderer, &mut search, size, false)
+            search_next(&mut renderer, &mut search, false)
         );
-        assert_eq!(top_at_third, renderer.top_line_index(size));
+        assert_eq!(top_at_third, renderer.top_line_index());
     }
 
     #[test]
     fn test_search_prev_reverses_direction() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = size(10, 3);
-        renderer.set_lines(
-            parse_command_output(b"hit\na\nhit\nb\nhit\nx\nx\nx\n"),
-            size,
-        );
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        renderer.set_lines(parse_command_output(b"hit\na\nhit\nb\nhit\nx\nx\nx\n"));
         let mut search = Search::new();
-        submit_prompt(&mut renderer, &mut search, size, true, "hit".to_owned());
-        search_next(&mut renderer, &mut search, size, false);
-        assert_line_visible(&renderer, size, 2);
+        submit_prompt(&mut renderer, &mut search, true, "hit".to_owned());
+        search_next(&mut renderer, &mut search, false);
+        assert_line_visible(&renderer, 2);
         assert_eq!(
             SearchOutcome::Found,
-            search_next(&mut renderer, &mut search, size, true)
+            search_next(&mut renderer, &mut search, true)
         );
-        assert_line_visible(&renderer, size, 0);
-        assert_eq!(0, renderer.top_line_index(size));
+        assert_line_visible(&renderer, 0);
+        assert_eq!(0, renderer.top_line_index());
     }
 
     #[test]
     fn test_search_next_centers_off_screen_match() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
-        // Content height is 5. A hit on line 10 is off the first page.
         let size = size(10, 6);
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        // Content height is 5. A hit on line 10 is off the first page.
         let mut text = String::new();
         for i in 0..20 {
             if i == 10 {
@@ -399,69 +385,63 @@ mod tests {
                 text.push_str("x\n");
             }
         }
-        renderer.set_lines(parse_command_output(text.as_bytes()), size);
+        renderer.set_lines(parse_command_output(text.as_bytes()));
         let mut search = Search::new();
         assert_eq!(
             SearchOutcome::Found,
-            submit_prompt(&mut renderer, &mut search, size, true, "TARGET".to_owned())
+            submit_prompt(&mut renderer, &mut search, true, "TARGET".to_owned())
         );
         // body/2 == 2, so the hit sits on the middle row: top is line 8.
-        assert_eq!(WrappedRow(8), renderer.top_row(size));
-        assert_eq!(8, renderer.top_line_index(size));
-        assert_line_visible(&renderer, size, 10);
+        assert_eq!(WrappedRow(8), renderer.top_row());
+        assert_eq!(8, renderer.top_line_index());
+        assert_line_visible(&renderer, 10);
     }
 
     #[test]
     fn test_search_next_does_not_scroll_when_match_is_on_screen() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
-        // Content height is 5, so lines 0..4 are on the first page.
         let size = size(20, 6);
-        renderer.set_lines(
-            parse_command_output(b"one\ntwo\nthree\nfour\nfive\nsix\n"),
-            size,
-        );
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        // Content height is 5, so lines 0..4 are on the first page.
+        renderer.set_lines(parse_command_output(b"one\ntwo\nthree\nfour\nfive\nsix\n"));
         let mut search = Search::new();
         assert_eq!(
             SearchOutcome::Found,
-            submit_prompt(&mut renderer, &mut search, size, true, "o".to_owned())
+            submit_prompt(&mut renderer, &mut search, true, "o".to_owned())
         );
         // "one" is already at the top; page must not move.
-        assert_eq!(WrappedRow(0), renderer.top_row(size));
-        let top_before = renderer.top_row(size);
+        assert_eq!(WrappedRow(0), renderer.top_row());
+        let top_before = renderer.top_row();
         // Next hit is "two", still on this page.
         assert_eq!(
             SearchOutcome::Found,
-            search_next(&mut renderer, &mut search, size, false)
+            search_next(&mut renderer, &mut search, false)
         );
         assert_eq!(
             Some("[2/3]".to_owned()),
             search.match_label(renderer.lines())
         );
-        assert_eq!(top_before, renderer.top_row(size));
+        assert_eq!(top_before, renderer.top_row());
         // "four" is also on this page.
         assert_eq!(
             SearchOutcome::Found,
-            search_next(&mut renderer, &mut search, size, false)
+            search_next(&mut renderer, &mut search, false)
         );
         assert_eq!(
             Some("[3/3]".to_owned()),
             search.match_label(renderer.lines())
         );
-        assert_eq!(top_before, renderer.top_row(size));
+        assert_eq!(top_before, renderer.top_row());
     }
 
     #[test]
     fn test_occurrence_index_on_same_line() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = size(20, 6);
-        renderer.set_lines(
-            parse_command_output(b"foo foo\nbar\nfoo\nx\nx\nx\nx\nx\n"),
-            size,
-        );
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        renderer.set_lines(parse_command_output(b"foo foo\nbar\nfoo\nx\nx\nx\nx\nx\n"));
         let mut search = Search::new();
         assert_eq!(
             SearchOutcome::Found,
-            submit_prompt(&mut renderer, &mut search, size, true, "foo".to_owned())
+            submit_prompt(&mut renderer, &mut search, true, "foo".to_owned())
         );
         assert_eq!(
             Some("[1/3]".to_owned()),
@@ -469,26 +449,26 @@ mod tests {
         );
         assert_eq!(
             SearchOutcome::Found,
-            search_next(&mut renderer, &mut search, size, false)
+            search_next(&mut renderer, &mut search, false)
         );
         assert_eq!(
             Some("[2/3]".to_owned()),
             search.match_label(renderer.lines())
         );
-        assert_eq!(0, renderer.top_line_index(size));
+        assert_eq!(0, renderer.top_line_index());
         assert_eq!(
             SearchOutcome::Found,
-            search_next(&mut renderer, &mut search, size, false)
+            search_next(&mut renderer, &mut search, false)
         );
         assert_eq!(
             Some("[3/3]".to_owned()),
             search.match_label(renderer.lines())
         );
         // The third hit is already on the first page, so the viewport stays put.
-        assert_eq!(0, renderer.top_line_index(size));
+        assert_eq!(0, renderer.top_line_index());
 
         let mut buf = Vec::new();
-        renderer.draw(&mut buf, size).unwrap();
+        renderer.draw(&mut buf).unwrap();
         let mut parser = vt_parser(6, 20);
         parser.process(&buf);
         // Current match is the "foo" on logical line 2, still on screen.
@@ -501,61 +481,60 @@ mod tests {
 
     #[test]
     fn test_empty_submit_repeats_pattern() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = size(10, 3);
-        renderer.set_lines(parse_command_output(b"hit\na\nhit\nx\nx\nx\n"), size);
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        renderer.set_lines(parse_command_output(b"hit\na\nhit\nx\nx\nx\n"));
         let mut search = Search::new();
-        submit_prompt(&mut renderer, &mut search, size, true, "hit".to_owned());
-        assert_eq!(0, renderer.top_line_index(size));
+        submit_prompt(&mut renderer, &mut search, true, "hit".to_owned());
+        assert_eq!(0, renderer.top_line_index());
         // Move off the first hit, then an empty forward submit starts again
         // from the current screen and can land on the second hit.
-        renderer.scroll_to_line(1, size);
+        renderer.scroll_to_line(1);
         search.clear_match();
         assert_eq!(
             SearchOutcome::Found,
-            submit_prompt(&mut renderer, &mut search, size, true, String::new())
+            submit_prompt(&mut renderer, &mut search, true, String::new())
         );
         // Second hit is on the page that starts at line 1, so do not jump.
-        assert_eq!(1, renderer.top_line_index(size));
-        assert_line_visible(&renderer, size, 2);
+        assert_eq!(1, renderer.top_line_index());
+        assert_line_visible(&renderer, 2);
     }
 
     #[test]
     fn test_empty_submit_without_pattern() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = size(10, 3);
-        renderer.set_lines(parse_command_output(b"a\n"), size);
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        renderer.set_lines(parse_command_output(b"a\n"));
         let mut search = Search::new();
         assert_eq!(
             SearchOutcome::NoPattern,
-            submit_prompt(&mut renderer, &mut search, size, true, String::new())
+            submit_prompt(&mut renderer, &mut search, true, String::new())
         );
     }
 
     #[test]
     fn test_search_next_after_move_restarts_from_screen_edge() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
-        // Content height is 5; three pages of hits.
         let size = size(20, 6);
-        renderer.set_lines(
-            parse_command_output(b"hit0\nx\nx\nx\nx\nhit1\nx\nx\nx\nx\nhit2\n"),
-            size,
-        );
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        // Content height is 5; three pages of hits.
+        renderer.set_lines(parse_command_output(
+            b"hit0\nx\nx\nx\nx\nhit1\nx\nx\nx\nx\nhit2\n",
+        ));
         let mut search = Search::new();
         assert_eq!(
             SearchOutcome::Found,
-            submit_prompt(&mut renderer, &mut search, size, true, "hit".to_owned())
+            submit_prompt(&mut renderer, &mut search, true, "hit".to_owned())
         );
         assert_eq!(
             Some("[1/3]".to_owned()),
             search.match_label(renderer.lines())
         );
         // Move to the last page, dropping the selected hit as a scroll does.
-        renderer.scroll_bottom(size);
+        renderer.scroll_bottom();
         search.clear_match();
         assert_eq!(
             SearchOutcome::Found,
-            search_next(&mut renderer, &mut search, size, false)
+            search_next(&mut renderer, &mut search, false)
         );
         // Forward restart begins at the top of the screen, not after hit0.
         assert_eq!(
@@ -569,7 +548,7 @@ mod tests {
         search.forward = false;
         assert_eq!(
             SearchOutcome::Found,
-            search_next(&mut renderer, &mut search, size, false)
+            search_next(&mut renderer, &mut search, false)
         );
         assert_eq!(
             Some("[1/3]".to_owned()),
@@ -579,13 +558,13 @@ mod tests {
 
     #[test]
     fn test_search_next_resumes_last_history_pattern() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = size(10, 6);
-        renderer.set_lines(parse_command_output(b"a\nfoo\nb\n"), size);
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        renderer.set_lines(parse_command_output(b"a\nfoo\nb\n"));
         let mut search = Search::new();
         assert_eq!(
             SearchOutcome::NoPattern,
-            search_next(&mut renderer, &mut search, size, false)
+            search_next(&mut renderer, &mut search, false)
         );
         let mut entries = Vec::new();
         entries.push("old".to_owned());
@@ -593,7 +572,7 @@ mod tests {
         search.resume_from_history(&entries);
         assert_eq!(
             SearchOutcome::Found,
-            search_next(&mut renderer, &mut search, size, false)
+            search_next(&mut renderer, &mut search, false)
         );
         assert_eq!(
             Some("[1/1]".to_owned()),
@@ -608,16 +587,16 @@ mod tests {
 
     #[test]
     fn test_not_found_does_not_move() {
-        let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = size(10, 3);
-        renderer.set_lines(parse_command_output(b"a\nb\nc\nd\n"), size);
-        renderer.scroll_down(size);
-        let before = renderer.top_line_index(size);
+        let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        renderer.set_lines(parse_command_output(b"a\nb\nc\nd\n"));
+        renderer.scroll_down();
+        let before = renderer.top_line_index();
         let mut search = Search::new();
         assert_eq!(
             SearchOutcome::NotFound,
-            submit_prompt(&mut renderer, &mut search, size, true, "zzz".to_owned())
+            submit_prompt(&mut renderer, &mut search, true, "zzz".to_owned())
         );
-        assert_eq!(before, renderer.top_line_index(size));
+        assert_eq!(before, renderer.top_line_index());
     }
 }

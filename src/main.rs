@@ -5,6 +5,7 @@ mod event_loop;
 mod height;
 mod help;
 mod interval_arg;
+mod lines_with_wrapped_row_count;
 mod mark;
 mod notify_pair;
 mod render;
