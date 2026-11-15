@@ -10,6 +10,9 @@ One use is to keep it open beside an agent and let it refresh the
 diff while the agent edits. The view updates in place, so you can
 watch the patch grow without rerunning the command yourself.
 
+The refresh interval is `-n` / `--interval` in seconds. If that flag
+is omitted, `LESS_IS_MORE_INTERVAL` is used. The default is 2.
+
 ```
 less-is-more -n 0.5 -- sl --config ui.color=always diff
 ```
