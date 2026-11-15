@@ -2,6 +2,7 @@ mod abort_on_drop_handle;
 mod capture;
 mod debug_or_test;
 mod height;
+mod help;
 mod interval_arg;
 mod notify_pair;
 mod output;
@@ -28,6 +29,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::abort_on_drop_handle::AbortOnDropHandle;
 use crate::capture::capture_command_output;
+use crate::help::help_lines;
 use crate::interval_arg::IntervalArg;
 use crate::notify_pair::NotifyRx;
 use crate::notify_pair::NotifyTx;
@@ -87,6 +89,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
     ));
 
     let mut renderer = Renderer::new(terminal_bg);
+    let mut help_renderer = Renderer::new(terminal_bg);
+    let mut showing_help = false;
     loop {
         tokio::select! {
             msg = output_rx.recv() => {
@@ -97,52 +101,52 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 };
                 let size = terminal_size()?;
                 renderer.set_lines(lines, size);
-                renderer.draw(&mut io::stdout(), size)?;
+                if !showing_help {
+                    renderer.draw(&mut io::stdout(), size)?;
+                }
             }
             action = recv_key_action(&mut keys) => {
                 match action? {
                     KeyAction::Quit => {
-                        // `capture_task` and `_key_reader` abort on drop.
-                        return Ok(());
+                        if showing_help {
+                            showing_help = false;
+                            let size = terminal_size()?;
+                            renderer.redraw(&mut io::stdout(), size)?;
+                        } else {
+                            // `capture_task` and `_key_reader` abort on drop.
+                            return Ok(());
+                        }
+                    }
+                    KeyAction::Help => {
+                        let size = terminal_size()?;
+                        if showing_help {
+                            showing_help = false;
+                            renderer.redraw(&mut io::stdout(), size)?;
+                        } else {
+                            showing_help = true;
+                            help_renderer.set_lines(help_lines(), size);
+                            help_renderer.scroll_top();
+                            help_renderer.redraw(&mut io::stdout(), size)?;
+                        }
                     }
                     KeyAction::Refresh => {
                         // Wakes the interval wait. A permit is stored if a
                         // capture is in progress, so the next wait is skipped.
                         refresh_tx.notify_one();
                     }
-                    KeyAction::ScrollDown => {
-                        let size = terminal_size()?;
-                        renderer.scroll_down(size);
-                        renderer.draw(&mut io::stdout(), size)?;
-                    }
-                    KeyAction::ScrollUp => {
-                        let size = terminal_size()?;
-                        renderer.scroll_up();
-                        renderer.draw(&mut io::stdout(), size)?;
-                    }
-                    KeyAction::Redraw => {
-                        let size = terminal_size()?;
-                        renderer.redraw(&mut io::stdout(), size)?;
-                    }
-                    KeyAction::ScrollTop => {
-                        let size = terminal_size()?;
-                        renderer.scroll_top();
-                        renderer.draw(&mut io::stdout(), size)?;
-                    }
-                    KeyAction::ScrollBottom => {
-                        let size = terminal_size()?;
-                        renderer.scroll_bottom(size);
-                        renderer.draw(&mut io::stdout(), size)?;
-                    }
-                    KeyAction::ScrollPageDown => {
-                        let size = terminal_size()?;
-                        renderer.scroll_page_down(size);
-                        renderer.draw(&mut io::stdout(), size)?;
-                    }
-                    KeyAction::ScrollPageUp => {
-                        let size = terminal_size()?;
-                        renderer.scroll_page_up(size);
-                        renderer.draw(&mut io::stdout(), size)?;
+                    action @ (KeyAction::ScrollDown
+                    | KeyAction::ScrollUp
+                    | KeyAction::Redraw
+                    | KeyAction::ScrollTop
+                    | KeyAction::ScrollBottom
+                    | KeyAction::ScrollPageDown
+                    | KeyAction::ScrollPageUp) => {
+                        let view = if showing_help {
+                            &mut help_renderer
+                        } else {
+                            &mut renderer
+                        };
+                        apply_view_action(view, action)?;
                     }
                 }
             }
@@ -178,8 +182,45 @@ async fn capture_command_output_loop(
     }
 }
 
+fn apply_view_action(view: &mut Renderer, action: KeyAction) -> io::Result<()> {
+    let size = terminal_size()?;
+    match action {
+        KeyAction::ScrollDown => {
+            view.scroll_down(size);
+            view.draw(&mut io::stdout(), size)?;
+        }
+        KeyAction::ScrollUp => {
+            view.scroll_up();
+            view.draw(&mut io::stdout(), size)?;
+        }
+        KeyAction::Redraw => {
+            view.redraw(&mut io::stdout(), size)?;
+        }
+        KeyAction::ScrollTop => {
+            view.scroll_top();
+            view.draw(&mut io::stdout(), size)?;
+        }
+        KeyAction::ScrollBottom => {
+            view.scroll_bottom(size);
+            view.draw(&mut io::stdout(), size)?;
+        }
+        KeyAction::ScrollPageDown => {
+            view.scroll_page_down(size);
+            view.draw(&mut io::stdout(), size)?;
+        }
+        KeyAction::ScrollPageUp => {
+            view.scroll_page_up(size);
+            view.draw(&mut io::stdout(), size)?;
+        }
+        KeyAction::Quit | KeyAction::Help | KeyAction::Refresh => {}
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
 enum KeyAction {
     Quit,
+    Help,
     Refresh,
     ScrollDown,
     ScrollUp,
@@ -207,6 +248,7 @@ fn key_action(event: &Event) -> Option<KeyAction> {
     }
     match key.code {
         KeyCode::Char('q') => Some(KeyAction::Quit),
+        KeyCode::Char('h') => Some(KeyAction::Help),
         KeyCode::Char('r') => Some(KeyAction::Refresh),
         KeyCode::Char('j') | KeyCode::Down => Some(KeyAction::ScrollDown),
         KeyCode::Char('k') | KeyCode::Up => Some(KeyAction::ScrollUp),
@@ -218,7 +260,7 @@ fn key_action(event: &Event) -> Option<KeyAction> {
     }
 }
 
-/// Receive key events until one is quit or refresh, or the reader ends.
+/// Receive key events until one maps to a key action, or the reader ends.
 /// Other events are discarded. The caller should race this against other
 /// work and drop it to stop waiting.
 async fn recv_key_action(keys: &mut UnboundedReceiver<io::Result<Event>>) -> io::Result<KeyAction> {
@@ -270,5 +312,49 @@ struct StopOnDrop(Arc<AtomicBool>);
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::Event;
+    use crossterm::event::KeyCode;
+    use crossterm::event::KeyEvent;
+    use crossterm::event::KeyEventKind;
+    use crossterm::event::KeyEventState;
+    use crossterm::event::KeyModifiers;
+
+    use crate::KeyAction;
+    use crate::key_action;
+
+    fn press(code: KeyCode) -> Event {
+        Event::Key(KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    #[test]
+    fn test_h_is_help() {
+        assert_eq!(
+            true,
+            matches!(
+                key_action(&press(KeyCode::Char('h'))),
+                Some(KeyAction::Help)
+            )
+        );
+    }
+
+    #[test]
+    fn test_q_is_quit() {
+        assert_eq!(
+            true,
+            matches!(
+                key_action(&press(KeyCode::Char('q'))),
+                Some(KeyAction::Quit)
+            )
+        );
     }
 }
