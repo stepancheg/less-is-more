@@ -4,24 +4,46 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::anyhow;
 use tokio::net::unix::pipe;
+use tokio::process::Child;
+use tokio::sync::mpsc::Sender;
+
+use crate::notify_pair::NotifyRx;
+use crate::terminal::line::Line;
+use crate::terminal::parse::parse_command_output;
+
+/// Result of a capture that may be cut short by `interrupt`.
+pub(crate) enum CaptureOutcome {
+    /// Child exited (or the pipe hit EOF) and output was collected.
+    Done(Vec<u8>),
+    /// `interrupt` fired. The child and its process group were killed.
+    Interrupted,
+}
 
 /// Run `command` and return its combined stdout and stderr bytes.
-pub(crate) async fn capture_command_output(command: &[String]) -> anyhow::Result<Vec<u8>> {
+/// A notification on `interrupt` kills the child and returns
+/// [`CaptureOutcome::Interrupted`].
+pub(crate) async fn capture_command_output_interruptible(
+    command: &[String],
+    interrupt: Option<&NotifyRx>,
+) -> anyhow::Result<CaptureOutcome> {
     let Some((program, args)) = command.split_first() else {
         return Err(anyhow!("empty command"));
     };
     // One pipe for both streams: the kernel keeps write order.
     let (reader, writer) = io::pipe()?;
     let stderr_writer = writer.try_clone()?;
+    // Own process group so an interrupt can kill grandchildren too.
     let mut child = tokio::process::Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(writer)
         .stderr(stderr_writer)
         .kill_on_drop(true)
+        .process_group(0)
         .spawn()?;
     // Tokio drives the read end. The child keeps a blocking write end.
     let reader = pipe::Receiver::from_owned_fd(OwnedFd::from(reader))?;
@@ -29,13 +51,18 @@ pub(crate) async fn capture_command_output(command: &[String]) -> anyhow::Result
     let mut buf = [0_u8; 8192];
     loop {
         tokio::select! {
+            biased;
+            () = wait_interrupt(interrupt) => {
+                kill_process_group(&mut child).await;
+                return Ok(CaptureOutcome::Interrupted);
+            }
             ready = reader.readable() => {
                 ready?;
                 match read_ready(&reader, &mut buf, &mut out)? {
                     ReadReady::Eof => {
                         let status = child.wait().await?;
                         append_nonzero_status(&status, &mut out);
-                        return Ok(out);
+                        return Ok(CaptureOutcome::Done(out));
                     }
                     ReadReady::Pending => {}
                 }
@@ -46,10 +73,58 @@ pub(crate) async fn capture_command_output(command: &[String]) -> anyhow::Result
                 // Drop the tokio registration and read whatever is already buffered.
                 drain_nonblocking(reader.into_nonblocking_fd()?, &mut out)?;
                 append_nonzero_status(&status, &mut out);
-                return Ok(out);
+                return Ok(CaptureOutcome::Done(out));
             }
         }
     }
+}
+
+/// Capture in a loop, sending each snapshot on `tx`.
+/// `refresh` kills the current command and starts the next run at once.
+pub(crate) async fn capture_command_output_loop(
+    command: Vec<String>,
+    interval: Duration,
+    tx: Sender<Vec<Line>>,
+    refresh: NotifyRx,
+) {
+    loop {
+        let outcome = capture_command_output_interruptible(&command, Some(&refresh)).await;
+        let lines = match outcome {
+            Ok(CaptureOutcome::Interrupted) => continue,
+            Ok(CaptureOutcome::Done(bytes)) => parse_command_output(&bytes),
+            Err(err) => {
+                let text = format!("error: {err:?}");
+                parse_command_output(text.as_bytes())
+            }
+        };
+        if tx.send(lines).await.is_err() {
+            return;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(interval) => {}
+            () = refresh.notified() => {}
+        }
+    }
+}
+
+async fn wait_interrupt(interrupt: Option<&NotifyRx>) {
+    match interrupt {
+        Some(rx) => rx.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// SIGKILL the child's process group, then reap the child.
+async fn kill_process_group(child: &mut Child) {
+    if let Some(id) = child.id() {
+        // SAFETY: `id` is the pid of a child we spawned with `process_group(0)`,
+        // so it is the process-group id. Negative pid targets that group.
+        unsafe {
+            libc::kill(-(id as i32), libc::SIGKILL);
+        }
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
 }
 
 enum ReadReady {
@@ -126,8 +201,16 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use crate::capture::capture_command_output;
+    use crate::capture::CaptureOutcome;
+    use crate::capture::capture_command_output_interruptible;
     use crate::capture::drain_nonblocking;
+
+    async fn capture_command_output(command: &[String]) -> anyhow::Result<Vec<u8>> {
+        match capture_command_output_interruptible(command, None).await? {
+            CaptureOutcome::Done(bytes) => Ok(bytes),
+            CaptureOutcome::Interrupted => Err(anyhow::anyhow!("capture interrupted")),
+        }
+    }
 
     #[test]
     fn test_drain_nonblocking_reads_buffer_and_stops_with_writer_open() {
@@ -180,6 +263,27 @@ mod tests {
         ];
         let bytes = capture_command_output(&command).await.unwrap();
         assert_eq!(b"no\nexit status: 3\n".as_slice(), bytes.as_slice());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_interrupt_kills_hung_command() {
+        use crate::notify_pair::NotifyTx;
+
+        let (tx, rx) = NotifyTx::pair();
+        let command = [String::from("sleep"), String::from("30")];
+        let capture = capture_command_output_interruptible(&command, Some(&rx));
+        let interrupter = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tx.notify_one();
+        };
+        let joined = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(capture, interrupter)
+        });
+        let (outcome, ()) = joined.await.expect("interrupt did not kill the child");
+        assert_eq!(
+            true,
+            matches!(outcome.unwrap(), CaptureOutcome::Interrupted)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

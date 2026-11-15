@@ -26,19 +26,15 @@ use std::time::Duration;
 use clap::Parser;
 use crossterm::event::Event;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::abort_on_drop_handle::AbortOnDropHandle;
-use crate::capture::capture_command_output;
+use crate::capture::capture_command_output_loop;
 use crate::event_loop::EventLoop;
 use crate::interval_arg::IntervalArg;
-use crate::notify_pair::NotifyRx;
 use crate::notify_pair::NotifyTx;
 use crate::render::terminal_size;
 use crate::search::history::store::History;
-use crate::terminal::line::Line;
-use crate::terminal::parse::parse_command_output;
 use crate::terminal_bg::query_terminal_bg;
 use crate::terminal_guard::TerminalGuard;
 use crate::terminal_guard::restore_terminal;
@@ -97,34 +93,6 @@ async fn main() -> anyhow::Result<()> {
     EventLoop::new(terminal_bg, history, size)
         .run(first_lines, output_rx, keys, refresh_tx, capture_task)
         .await
-}
-
-/// Repeatedly capture command output, parse it, and send each snapshot on `tx`.
-/// A capture error is parsed as an `error: ...` line and sent the same way.
-/// `refresh` ends the interval wait so the next capture starts immediately.
-/// Stops when `tx` is closed.
-async fn capture_command_output_loop(
-    command: Vec<String>,
-    interval: Duration,
-    tx: Sender<Vec<Line>>,
-    refresh: NotifyRx,
-) {
-    loop {
-        let lines = match capture_command_output(&command).await {
-            Ok(bytes) => parse_command_output(&bytes),
-            Err(err) => {
-                let text = format!("error: {err:?}");
-                parse_command_output(text.as_bytes())
-            }
-        };
-        if tx.send(lines).await.is_err() {
-            return;
-        }
-        tokio::select! {
-            () = tokio::time::sleep(interval) => {}
-            () = refresh.notified() => {}
-        }
-    }
 }
 
 fn spawn_key_reader(

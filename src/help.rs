@@ -6,7 +6,7 @@ Keys
 
   h              Show this help
   q              Quit
-  r              Run the command now
+  r              Run the command now (kills the current run)
   j, Down, Enter Scroll down
   k, Up          Scroll up
   Space, PgDn    Page down
@@ -54,6 +54,10 @@ mod tests {
             .collect::<Vec<String>>()
             .join("\n");
         assert_eq!(true, text.contains("h              Show this help"));
+        assert_eq!(
+            true,
+            text.contains("r              Run the command now (kills the current run)")
+        );
         assert_eq!(true, text.contains("q              Quit"));
         assert_eq!(true, text.contains("q or h closes this page."));
         assert_eq!(
