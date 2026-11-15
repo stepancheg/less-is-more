@@ -242,20 +242,14 @@ impl Renderer {
         }
         let terminal_width = size.width;
         let body_height = content_height(size.height.0);
-        let light_terminal = self.terminal_bg == TerminalBg::Light;
-        let all = visual_rows(
-            &self.lines,
-            terminal_width,
-            self.highlight.as_ref(),
-            light_terminal,
-        );
+        let total = visual_row_count(&self.lines, terminal_width);
         let top = cmp::min(
             wrapped_row_of_pos(&self.lines, terminal_width, self.pos),
-            max_row(all.len(), body_height),
+            max_row(total, body_height),
         );
-        let start = cmp::min(top.as_usize(), all.len());
-        let end = cmp::min(start.saturating_add(body_height as usize), all.len());
-        let ruler = viewport_ruler(start, end, all.len());
+        let start = cmp::min(top.as_usize(), total);
+        let end = cmp::min(start.saturating_add(body_height as usize), total);
+        let ruler = viewport_ruler(start, end, total);
         let ruler_cols = display_width(&ruler).0.min(size.width.0);
         // Keep one column between the label and the ruler when both fit.
         let label_cols = if ruler_cols == 0 {
@@ -263,8 +257,14 @@ impl Renderer {
         } else {
             size.width.0.saturating_sub(ruler_cols).saturating_sub(1)
         };
-        let mut all = all;
-        let visible: Vec<VisualRow> = all.drain(start..end).collect();
+        let visible = visual_rows_in_range(
+            &self.lines,
+            terminal_width,
+            self.highlight.as_ref(),
+            self.terminal_bg,
+            WrappedRow::try_from(start).unwrap_or(WrappedRow::MAX),
+            WrappedRow::try_from(end).unwrap_or(WrappedRow::MAX),
+        );
         let keys: Vec<String> = visible.iter().map(row_fingerprint).collect();
         // Cursor only for an editable prompt (`/?`), which sets a caret.
         let show_cursor = self.status_caret.is_some();
@@ -565,7 +565,37 @@ fn slice_cols(s: &str, skip_cols: u32, max_cols: u32) -> String {
 }
 
 fn visual_row_count(lines: &[Line], terminal_width: Width) -> usize {
-    visual_rows(lines, terminal_width, None, false).len()
+    let mut n = 0usize;
+    for line in lines {
+        n = n.saturating_add(line_visual_row_count(line, terminal_width).as_usize());
+    }
+    n
+}
+
+/// Wrapped rows `line` occupies at `terminal_width`.
+/// Matches `line_visual_rows(..., None, ...).len()` without building rows.
+/// A line with no placeable glyph still occupies one row, unless the
+/// terminal width is 0.
+fn line_visual_row_count(line: &Line, terminal_width: Width) -> WrappedRow {
+    if terminal_width == 0 {
+        return WrappedRow(0);
+    }
+    let mut col = Width(0);
+    let mut rows = WrappedRow(1);
+    for span in &line.spans {
+        for ch in span.content.as_ref().chars() {
+            let w = ch.width();
+            if w > terminal_width {
+                continue;
+            }
+            if col + w > terminal_width {
+                rows = rows.saturating_add(WrappedRow(1));
+                col = Width(0);
+            }
+            col += w;
+        }
+    }
+    rows
 }
 
 fn line_byte_len(line: &Line) -> usize {
@@ -640,8 +670,7 @@ fn visual_row_of_logical_line(
 ) -> WrappedRow {
     let mut acc = WrappedRow(0);
     for line in lines.iter().take(line_idx) {
-        let n = WrappedRow::try_from(line_visual_rows(line, terminal_width, None, 0, false).len())
-            .unwrap_or(WrappedRow::MAX);
+        let n = line_visual_row_count(line, terminal_width);
         acc = acc.saturating_add(n);
     }
     acc
@@ -654,8 +683,7 @@ fn logical_line_at_visual_row(
 ) -> usize {
     let mut acc = WrappedRow(0);
     for (i, line) in lines.iter().enumerate() {
-        let n = WrappedRow::try_from(line_visual_rows(line, terminal_width, None, 0, false).len())
-            .unwrap_or(WrappedRow::MAX);
+        let n = line_visual_row_count(line, terminal_width);
         // A blank line still occupies one visual row, so n is at least 1
         // unless the terminal width is 0.
         let n = cmp::max(n, WrappedRow(1));
@@ -704,19 +732,53 @@ fn write_one_line(
     Ok(())
 }
 
-fn visual_rows(
+/// Build the wrapped rows in the half-open range `start..end`.
+///
+/// `start` and `end` are [`WrappedRow`] indices: positions in the
+/// sequence of rows after width-wrapping, not indices into `lines`.
+/// Lines entirely outside that range are counted, not built.
+/// A line that crosses an edge is built and then trimmed.
+fn visual_rows_in_range(
     lines: &[Line],
     terminal_width: Width,
     highlight: Option<&Highlight>,
-    light_terminal: bool,
+    terminal_bg: TerminalBg,
+    start: WrappedRow,
+    end: WrappedRow,
 ) -> Vec<VisualRow> {
     let mut rows = Vec::new();
-    if terminal_width == 0 {
+    if terminal_width == 0 || start >= end {
         return rows;
     }
+    let mut acc = WrappedRow(0);
     for (line_idx, line) in lines.iter().enumerate() {
-        for part in line_visual_rows(line, terminal_width, highlight, line_idx, light_terminal) {
+        let n = line_visual_row_count(line, terminal_width);
+        if n == WrappedRow(0) {
+            continue;
+        }
+        let line_end = acc.saturating_add(n);
+        if line_end <= start {
+            acc = line_end;
+            continue;
+        }
+        if acc >= end {
+            break;
+        }
+        // Rows of this line before `start`, and how many of its rows
+        // fall in `start..end`.
+        let skip = start.saturating_sub(acc);
+        let keep = cmp::min(line_end, end).saturating_sub(cmp::max(acc, start));
+        let built = line_visual_rows(line, terminal_width, highlight, line_idx, terminal_bg);
+        for part in built
+            .into_iter()
+            .skip(skip.as_usize())
+            .take(keep.as_usize())
+        {
             rows.push(part);
+        }
+        acc = line_end;
+        if acc >= end {
+            break;
         }
     }
     rows
@@ -759,7 +821,7 @@ fn line_visual_rows(
     terminal_width: Width,
     highlight: Option<&Highlight>,
     line_idx: usize,
-    light_terminal: bool,
+    terminal_bg: TerminalBg,
 ) -> Vec<VisualRow> {
     let mut rows = Vec::new();
     if terminal_width == 0 {
@@ -782,8 +844,8 @@ fn line_visual_rows(
     let mut byte_off = 0usize;
     for span in &line.spans {
         let plain_sgr = span.style.sgr_sequence();
-        let highlight_sgr = search_highlight(span.style, light_terminal, false).sgr_sequence();
-        let current_sgr = search_highlight(span.style, light_terminal, true).sgr_sequence();
+        let highlight_sgr = search_highlight(span.style, terminal_bg, false).sgr_sequence();
+        let current_sgr = search_highlight(span.style, terminal_bg, true).sgr_sequence();
         for ch in span.content.as_ref().chars() {
             let text = ch.as_str().as_str();
             let ch_end = byte_off + text.len();
@@ -846,10 +908,16 @@ pub(crate) fn terminal_size() -> io::Result<Size> {
 
 #[cfg(test)]
 mod tests {
+    use std::cmp;
     use std::num::NonZeroU16;
 
     use crate::height::Height;
     use crate::render::Renderer;
+    use crate::render::line_visual_row_count;
+    use crate::render::line_visual_rows;
+    use crate::render::row_fingerprint;
+    use crate::render::visual_row_count;
+    use crate::render::visual_rows_in_range;
     use crate::size::Size;
     use crate::terminal::color::TerminalColor;
     use crate::terminal::parse::parse_command_output;
@@ -858,6 +926,7 @@ mod tests {
     use crate::theme::NVIM_DARK_GREY1;
     use crate::theme::NVIM_DARK_YELLOW;
     use crate::theme::NVIM_LIGHT_YELLOW;
+    use crate::wrapped_row::WrappedRow;
 
     fn vt_parser(rows: u16, cols: u16) -> vt100::Parser {
         vt100::Parser::new(
@@ -978,6 +1047,69 @@ mod tests {
         assert_eq!("0123456789abcdefghij", content);
         assert_eq!(false, text.contains('\n'));
         assert_eq!(false, text.contains('\r'));
+    }
+
+    #[test]
+    fn test_visual_row_count_matches_built_rows() {
+        // Width 1 drops every double-width glyph; the line still takes a row.
+        let inputs: [&[u8]; 8] = [
+            b"",
+            b"\n",
+            b"a",
+            b"abcdef\ngh\n",
+            b"\n\n\n",
+            b"\x1b[31mhello world\x1b[0m\n",
+            "宽宽宽\n".as_bytes(),
+            b"0123456789abcdefghij\n",
+        ];
+        for input in inputs {
+            let lines = parse_command_output(input);
+            for width in [0_u32, 1, 2, 3, 5, 8, 10, 80] {
+                let terminal_width = Width(width);
+                let mut built_total = 0usize;
+                for (line_idx, line) in lines.iter().enumerate() {
+                    let built =
+                        line_visual_rows(line, terminal_width, None, line_idx, TerminalBg::Dark)
+                            .len();
+                    assert_eq!(
+                        built,
+                        line_visual_row_count(line, terminal_width).as_usize()
+                    );
+                    built_total = built_total.saturating_add(built);
+                }
+                assert_eq!(built_total, visual_row_count(&lines, terminal_width));
+                // A window that starts and ends mid-buffer, including a
+                // window that splits a wrapped line, matches a full build.
+                let total = built_total;
+                if total == 0 {
+                    continue;
+                }
+                let mut full = Vec::new();
+                for (line_idx, line) in lines.iter().enumerate() {
+                    for part in
+                        line_visual_rows(line, terminal_width, None, line_idx, TerminalBg::Dark)
+                    {
+                        full.push(part);
+                    }
+                }
+                let start = total / 3;
+                let end = cmp::min(total, start.saturating_add(cmp::max(1, total / 2)));
+                let sliced = visual_rows_in_range(
+                    &lines,
+                    terminal_width,
+                    None,
+                    TerminalBg::Dark,
+                    WrappedRow::try_from(start).unwrap(),
+                    WrappedRow::try_from(end).unwrap(),
+                );
+                assert_eq!(end - start, sliced.len());
+                for (got, expected) in sliced.iter().zip(full[start..end].iter()) {
+                    assert_eq!(expected.width, got.width);
+                    assert_eq!(expected.soft_wrap, got.soft_wrap);
+                    assert_eq!(row_fingerprint(expected), row_fingerprint(got));
+                }
+            }
+        }
     }
 
     #[test]
