@@ -88,6 +88,13 @@ mod tests {
         let mut parser = vt100::Parser::new(30, 80, 0);
         parser.process(&buf);
         assert_eq!(true, parser.screen().contents().contains("Show this help"));
-        assert_eq!(true, parser.screen().contents().contains("(END)"));
+        let mut ruler = String::new();
+        for col in 77..80 {
+            let cell = parser.screen().cell(29, col).unwrap();
+            if cell.has_contents() {
+                ruler.push_str(cell.contents());
+            }
+        }
+        assert_eq!("Bot", ruler);
     }
 }

@@ -274,7 +274,7 @@ mod tests {
                 text.push(' ');
             }
         }
-        assert_eq!("/foo", text.trim_end());
+        assert_eq!("/foo   Top", text.trim_end());
     }
 
     #[test]

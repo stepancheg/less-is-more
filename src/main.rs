@@ -35,6 +35,7 @@ use crate::event_loop::EventLoop;
 use crate::interval_arg::IntervalArg;
 use crate::notify_pair::NotifyRx;
 use crate::notify_pair::NotifyTx;
+use crate::render::terminal_size;
 use crate::search::history::store::History;
 use crate::terminal::line::Line;
 use crate::terminal::parse::parse_command_output;
@@ -65,18 +66,10 @@ fn install_panic_hook() {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let history = History::load_from_home().await;
-    install_panic_hook();
-    // Query before raw mode; the color query reads a terminal response.
-    let terminal_bg = query_terminal_bg();
-    let _guard = TerminalGuard::enter_alt_mode()?;
 
-    // One reader thread: crossterm events must not be polled concurrently.
-    // `poll` with a timeout lets the thread exit after `stop` is set.
-    let stop = Arc::new(AtomicBool::new(false));
-    let _stop_on_drop = StopOnDrop(Arc::clone(&stop));
-    let (_key_reader, keys) = spawn_key_reader(stop);
-
-    let (output_tx, output_rx) = mpsc::channel(1);
+    // Capture the first snapshot on the primary screen so the alternate
+    // screen is not shown empty while the command runs.
+    let (output_tx, mut output_rx) = mpsc::channel(1);
     let (refresh_tx, refresh_rx) = NotifyTx::pair();
     let capture_task = AbortOnDropHandle::spawn(capture_command_output_loop(
         args.command,
@@ -84,9 +77,25 @@ async fn main() -> anyhow::Result<()> {
         output_tx,
         refresh_rx,
     ));
+    let Some(first_lines) = output_rx.recv().await else {
+        capture_task.await?;
+        return Ok(());
+    };
 
-    EventLoop::new(terminal_bg, history)
-        .run(output_rx, keys, refresh_tx, capture_task)
+    install_panic_hook();
+    // Query before raw mode; the color query reads a terminal response.
+    let terminal_bg = query_terminal_bg();
+    let _guard = TerminalGuard::enter_alt_mode()?;
+    let size = terminal_size()?;
+
+    // One reader thread: crossterm events must not be polled concurrently.
+    // `poll` with a timeout lets the thread exit after `stop` is set.
+    let stop = Arc::new(AtomicBool::new(false));
+    let _stop_on_drop = StopOnDrop(Arc::clone(&stop));
+    let (_key_reader, keys) = spawn_key_reader(stop);
+
+    EventLoop::new(terminal_bg, history, size)
+        .run(first_lines, output_rx, keys, refresh_tx, capture_task)
         .await
 }
 

@@ -9,24 +9,35 @@ pub(crate) const PATTERN_NOT_FOUND: &str = "Pattern not found";
 pub(crate) const NO_PREVIOUS_SEARCH: &str = "No previous search";
 
 /// Status line to show after a command-output refresh.
-/// A "Pattern not found" message stays up until the user issues a command.
+/// "Pattern not found" and the `-i`/`-I` case-mode message stay up
+/// until the user issues a command.
 pub(crate) fn status_after_output(
     current_status: Option<&str>,
     match_label: Option<String>,
 ) -> Option<String> {
-    let not_found = current_status.is_some_and(|status| status.starts_with(PATTERN_NOT_FOUND));
-    if !not_found {
-        return match_label;
-    }
-    match match_label {
-        Some(label) => {
-            let mut msg = String::from(PATTERN_NOT_FOUND);
-            msg.push(' ');
-            msg.push_str(&label);
-            Some(msg)
+    if let Some(status) = current_status {
+        if is_case_mode_status(status) {
+            return Some(status.to_owned());
         }
-        None => Some(PATTERN_NOT_FOUND.to_owned()),
+        if status.starts_with(PATTERN_NOT_FOUND) {
+            return match match_label {
+                Some(label) => {
+                    let mut msg = String::from(PATTERN_NOT_FOUND);
+                    msg.push(' ');
+                    msg.push_str(&label);
+                    Some(msg)
+                }
+                None => Some(PATTERN_NOT_FOUND.to_owned()),
+            };
+        }
     }
+    match_label
+}
+
+fn is_case_mode_status(status: &str) -> bool {
+    status == CaseMode::Sensitive.label()
+        || status == CaseMode::IgnoreCase.label()
+        || status == CaseMode::IgnoreCaseAlways.label()
 }
 
 /// less `-i` / `-I` case handling.
@@ -280,5 +291,17 @@ mod tests {
             status_after_output(Some("[1/3]"), Some("[2/3]".to_owned()))
         );
         assert_eq!(None, status_after_output(None, None));
+        assert_eq!(
+            Some("Ignore case".to_owned()),
+            status_after_output(Some("Ignore case"), Some("[2/3]".to_owned()))
+        );
+        assert_eq!(
+            Some("Ignore case always".to_owned()),
+            status_after_output(Some("Ignore case always"), None)
+        );
+        assert_eq!(
+            Some("Case sensitive".to_owned()),
+            status_after_output(Some("Case sensitive"), Some("[1/1]".to_owned()))
+        );
     }
 }

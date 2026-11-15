@@ -36,7 +36,8 @@ pub(crate) struct Renderer {
     lines: Vec<Line>,
     drawn: Option<DrawnFrame>,
     terminal_bg: TerminalBg,
-    /// Replaces the `(END)` label while a prompt or message is showing.
+    /// Left side of the status bar while a prompt or message is showing.
+    /// The right side is the viewport ruler (`Top` / `Bot` / `NN%`).
     status_label: Option<String>,
     /// Caret column in `status_label`. `None` means the end of the label.
     status_caret: Option<u32>,
@@ -56,6 +57,7 @@ struct DrawnFrame {
     rows: Vec<String>,
     status: String,
     caret: u32,
+    cursor: bool,
 }
 
 impl Renderer {
@@ -237,20 +239,27 @@ impl Renderer {
         );
         let start = cmp::min(top.as_usize(), all.len());
         let end = cmp::min(start.saturating_add(body_height as usize), all.len());
-        let at_end = end == all.len();
+        let ruler = viewport_ruler(start, end, all.len());
+        let ruler_cols = display_width(&ruler).0.min(size.width.0);
+        // Keep one column between the label and the ruler when both fit.
+        let label_cols = if ruler_cols == 0 {
+            size.width.0
+        } else {
+            size.width.0.saturating_sub(ruler_cols).saturating_sub(1)
+        };
         let mut all = all;
         let visible: Vec<VisualRow> = all.drain(start..end).collect();
         let keys: Vec<String> = visible.iter().map(row_fingerprint).collect();
-        let show_cursor = self.status_label.is_some();
+        // Cursor only for an editable prompt (`/?`), which sets a caret.
+        let show_cursor = self.status_caret.is_some();
         let (label, caret) = match &self.status_label {
             Some(label) => {
                 let caret = self.status_caret.unwrap_or_else(|| display_width(label).0);
-                fit_label_to_caret(label, size.width, caret)
+                fit_label_to_caret(label, Width(label_cols), caret)
             }
-            None if at_end => (take_prefix_cols("(END)", size.width), 0),
             None => (String::new(), 0),
         };
-        let status = status_bar_fingerprint(self.terminal_bg, size.width, &label);
+        let status = status_bar_fingerprint(self.terminal_bg, size.width, &label, &ruler);
         let unchanged = match &self.drawn {
             Some(drawn) => {
                 !force
@@ -258,6 +267,7 @@ impl Renderer {
                     && drawn.rows == keys
                     && drawn.status == status
                     && drawn.caret == caret
+                    && drawn.cursor == show_cursor
             }
             None => false,
         };
@@ -277,6 +287,7 @@ impl Renderer {
             rows: keys,
             status,
             caret,
+            cursor: show_cursor,
         });
         Ok(())
     }
@@ -342,18 +353,55 @@ fn row_fingerprint(row: &VisualRow) -> String {
     s
 }
 
-fn status_bar_fingerprint(terminal_bg: TerminalBg, width: Width, label: &str) -> String {
+fn status_bar_fingerprint(
+    terminal_bg: TerminalBg,
+    width: Width,
+    label: &str,
+    ruler: &str,
+) -> String {
     if width == 0 {
         return String::new();
     }
     let mut line = String::from(terminal_bg.status_bar_sgr());
-    line.push_str(label);
-    let mut cols = display_width(label);
-    while cols < width {
+    let ruler_cols = display_width(ruler).0.min(width.0);
+    let ruler = if display_width(ruler).0 > width.0 {
+        take_prefix_cols(ruler, width)
+    } else {
+        ruler.to_owned()
+    };
+    let label_cols = display_width(label).0;
+    let mut cols = Width(0);
+    if label_cols + ruler_cols <= width.0 {
+        line.push_str(label);
+        cols += Width(label_cols);
+    } else if ruler_cols < width.0 {
+        let room = width.0 - ruler_cols - 1;
+        let fitted = take_prefix_cols(label, Width(room));
+        line.push_str(&fitted);
+        cols += display_width(&fitted);
+    }
+    let pad_until = Width(width.0.saturating_sub(ruler_cols));
+    while cols < pad_until {
         line.push(' ');
         cols += Width(1);
     }
+    line.push_str(&ruler);
     line
+}
+
+/// Nvim-style ruler for the viewport: `Top`, `Bot`, or `NN%`.
+/// `top` is the first visible row, `end` is one past the last visible
+/// row, and `total` is the number of wrapped rows.
+fn viewport_ruler(top: usize, end: usize, total: usize) -> String {
+    if total == 0 || end >= total {
+        return String::from("Bot");
+    }
+    if top == 0 {
+        return String::from("Top");
+    }
+    let pct = (end as u64 * 100 / total as u64) as u32;
+    let pct = cmp::min(cmp::max(pct, 1), 99);
+    format!("{pct}%")
 }
 
 fn write_cursor(out: &mut impl Write, size: Size, caret: u32, show_cursor: bool) -> io::Result<()> {
@@ -791,7 +839,7 @@ mod tests {
         assert_eq!("b", row_text(&parser, 1, 10));
         assert_eq!("c", row_text(&parser, 2, 10));
         assert_eq!("", row_text(&parser, 3, 10));
-        assert_eq!("(END)", row_text(&parser, 4, 10));
+        assert_eq!("       Bot", row_text(&parser, 4, 10));
     }
 
     #[test]
@@ -799,7 +847,7 @@ mod tests {
         let parser = draw_screen(b"a\nb\nc\nd\n", 10, 3, 0);
         assert_eq!("a", row_text(&parser, 0, 10));
         assert_eq!("b", row_text(&parser, 1, 10));
-        assert_eq!("", row_text(&parser, 2, 10));
+        assert_eq!("       Top", row_text(&parser, 2, 10));
     }
 
     #[test]
@@ -807,7 +855,7 @@ mod tests {
         let parser = draw_screen(b"a\nb\nc\nd\n", 10, 3, 1);
         assert_eq!("b", row_text(&parser, 0, 10));
         assert_eq!("c", row_text(&parser, 1, 10));
-        assert_eq!("", row_text(&parser, 2, 10));
+        assert_eq!("       75%", row_text(&parser, 2, 10));
     }
 
     #[test]
@@ -815,7 +863,7 @@ mod tests {
         let parser = draw_screen(b"0123456789abcdefghij\nTAIL\n", 10, 3, 0);
         assert_eq!("0123456789", row_text(&parser, 0, 10));
         assert_eq!("abcdefghij", row_text(&parser, 1, 10));
-        assert_eq!("", row_text(&parser, 2, 10));
+        assert_eq!("       Top", row_text(&parser, 2, 10));
         assert_eq!(
             true,
             parser.screen().contents().contains("0123456789abcdefghij")
@@ -828,7 +876,7 @@ mod tests {
         let parser = draw_screen(b"0123456789\nnext\n", 10, 3, 0);
         assert_eq!("0123456789", row_text(&parser, 0, 10));
         assert_eq!("next", row_text(&parser, 1, 10));
-        assert_eq!("(END)", row_text(&parser, 2, 10));
+        assert_eq!("       Bot", row_text(&parser, 2, 10));
     }
 
     #[test]
@@ -859,7 +907,7 @@ mod tests {
         let parser = draw_screen(b"0123456789abcdefghij\nTAIL\n", 10, 3, 1);
         assert_eq!("abcdefghij", row_text(&parser, 0, 10));
         assert_eq!("TAIL", row_text(&parser, 1, 10));
-        assert_eq!("(END)", row_text(&parser, 2, 10));
+        assert_eq!("       Bot", row_text(&parser, 2, 10));
     }
 
     #[test]
@@ -873,7 +921,7 @@ mod tests {
         parser.process(&buf);
         assert_eq!("c", row_text(&parser, 0, 10));
         assert_eq!("d", row_text(&parser, 1, 10));
-        assert_eq!("(END)", row_text(&parser, 2, 10));
+        assert_eq!("       Bot", row_text(&parser, 2, 10));
         renderer.scroll_top();
         buf.clear();
         renderer.draw(&mut buf, size(10, 3)).unwrap();
@@ -881,7 +929,7 @@ mod tests {
         parser.process(&buf);
         assert_eq!("a", row_text(&parser, 0, 10));
         assert_eq!("b", row_text(&parser, 1, 10));
-        assert_eq!("", row_text(&parser, 2, 10));
+        assert_eq!("       Top", row_text(&parser, 2, 10));
         renderer.scroll_bottom(size(10, 3));
         let saved = renderer.top_pos(size(10, 3));
         renderer.scroll_top();
@@ -925,7 +973,7 @@ mod tests {
         parser.process(&buf);
         assert_eq!("c", row_text(&parser, 0, 10));
         assert_eq!("d", row_text(&parser, 1, 10));
-        assert_eq!("", row_text(&parser, 2, 10));
+        assert_eq!("       66%", row_text(&parser, 2, 10));
         renderer.scroll_page_up(size(10, 3));
         buf.clear();
         renderer.draw(&mut buf, size(10, 3)).unwrap();
@@ -933,7 +981,7 @@ mod tests {
         parser.process(&buf);
         assert_eq!("a", row_text(&parser, 0, 10));
         assert_eq!("b", row_text(&parser, 1, 10));
-        assert_eq!("", row_text(&parser, 2, 10));
+        assert_eq!("       Top", row_text(&parser, 2, 10));
     }
 
     #[test]
@@ -941,7 +989,7 @@ mod tests {
         let parser = draw_screen(b"a\nb\nc\nd\n", 10, 3, 3);
         assert_eq!("c", row_text(&parser, 0, 10));
         assert_eq!("d", row_text(&parser, 1, 10));
-        assert_eq!("(END)", row_text(&parser, 2, 10));
+        assert_eq!("       Bot", row_text(&parser, 2, 10));
     }
 
     #[test]
@@ -1065,7 +1113,7 @@ mod tests {
         let parser = draw_screen(b"a\n", 10, 3, 0);
         assert_eq!("a", row_text(&parser, 0, 10));
         assert_eq!("", row_text(&parser, 1, 10));
-        assert_eq!("(END)", row_text(&parser, 2, 10));
+        assert_eq!("       Bot", row_text(&parser, 2, 10));
         let cell = parser.screen().cell(2, 0).unwrap();
         assert_eq!(vt100::Color::Idx(8), cell.bgcolor());
         let pad = parser.screen().cell(2, 9).unwrap();
@@ -1073,11 +1121,11 @@ mod tests {
     }
 
     #[test]
-    fn test_status_bar_hides_end_when_more_below() {
+    fn test_status_bar_shows_top_when_more_below() {
         let parser = draw_screen(b"a\nb\nc\n", 10, 3, 0);
         assert_eq!("a", row_text(&parser, 0, 10));
         assert_eq!("b", row_text(&parser, 1, 10));
-        assert_eq!("", row_text(&parser, 2, 10));
+        assert_eq!("       Top", row_text(&parser, 2, 10));
         let cell = parser.screen().cell(2, 0).unwrap();
         assert_eq!(vt100::Color::Idx(8), cell.bgcolor());
     }
@@ -1090,7 +1138,7 @@ mod tests {
         renderer.draw(&mut buf, size(10, 2)).unwrap();
         let mut parser = vt100::Parser::new(2, 10, 0);
         parser.process(&buf);
-        assert_eq!("(END)", row_text(&parser, 1, 10));
+        assert_eq!("       Bot", row_text(&parser, 1, 10));
         let cell = parser.screen().cell(1, 0).unwrap();
         assert_eq!(vt100::Color::Idx(7), cell.bgcolor());
         let pad = parser.screen().cell(1, 9).unwrap();

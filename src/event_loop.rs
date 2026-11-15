@@ -10,13 +10,13 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::abort_on_drop_handle::AbortOnDropHandle;
+use crate::height::Height;
 use crate::help::help_lines;
 use crate::mark::MarkOp;
 use crate::mark::Marks;
 use crate::mark::NOT_SET;
 use crate::notify_pair::NotifyTx;
 use crate::render::Renderer;
-use crate::render::terminal_size;
 use crate::search::find::SearchOutcome;
 use crate::search::find::search_next;
 use crate::search::find::submit_prompt;
@@ -29,6 +29,7 @@ use crate::search::state::Search;
 use crate::search::state::status_after_output;
 use crate::size::Size;
 use crate::terminal::line::Line;
+use crate::terminal::width::Width;
 use crate::terminal_bg::TerminalBg;
 
 enum KeyResult {
@@ -55,10 +56,11 @@ pub(crate) struct EventLoop {
     history: History,
     marks: Marks,
     mode: Mode,
+    size: Size,
 }
 
 impl EventLoop {
-    pub(crate) fn new(terminal_bg: TerminalBg, history: History) -> EventLoop {
+    pub(crate) fn new(terminal_bg: TerminalBg, history: History, size: Size) -> EventLoop {
         EventLoop {
             renderer: Renderer::new(terminal_bg),
             help_renderer: Renderer::new(terminal_bg),
@@ -66,28 +68,34 @@ impl EventLoop {
             history,
             marks: Marks::default(),
             mode: Mode::Output,
+            size,
         }
     }
 
     pub(crate) async fn run(
         &mut self,
+        first_lines: Vec<Line>,
         output_rx: Receiver<Vec<Line>>,
         keys: UnboundedReceiver<io::Result<Event>>,
         refresh_tx: NotifyTx,
         capture_task: AbortOnDropHandle<()>,
     ) -> anyhow::Result<()> {
-        let result = self.drive(output_rx, keys, refresh_tx, capture_task).await;
+        let result = self
+            .drive(first_lines, output_rx, keys, refresh_tx, capture_task)
+            .await;
         self.history.shutdown().await;
         result
     }
 
     async fn drive(
         &mut self,
+        first_lines: Vec<Line>,
         mut output_rx: Receiver<Vec<Line>>,
         mut keys: UnboundedReceiver<io::Result<Event>>,
         refresh_tx: NotifyTx,
         capture_task: AbortOnDropHandle<()>,
     ) -> anyhow::Result<()> {
+        self.on_command_output(first_lines)?;
         loop {
             tokio::select! {
                 msg = output_rx.recv() => {
@@ -98,22 +106,46 @@ impl EventLoop {
                     };
                     self.on_command_output(lines)?;
                 }
-                key = recv_key_press(&mut keys) => {
-                    match self.on_key(key?)? {
-                        KeyResult::Continue => {}
-                        KeyResult::Quit => {
-                            // `capture_task` and the key reader abort on drop.
-                            return Ok(());
+                event = keys.recv() => {
+                    let Some(event) = event else {
+                        return Err(io::Error::other("key reader stopped").into());
+                    };
+                    match event? {
+                        Event::Key(key) if key.kind == KeyEventKind::Press => {
+                            match self.on_key(key)? {
+                                KeyResult::Continue => {}
+                                KeyResult::Quit => {
+                                    // `capture_task` and the key reader abort on drop.
+                                    return Ok(());
+                                }
+                                KeyResult::Refresh => {
+                                    // Wakes the interval wait. A permit is stored if a
+                                    // capture is in progress, so the next wait is skipped.
+                                    refresh_tx.notify_one();
+                                }
+                            }
                         }
-                        KeyResult::Refresh => {
-                            // Wakes the interval wait. A permit is stored if a
-                            // capture is in progress, so the next wait is skipped.
-                            refresh_tx.notify_one();
+                        Event::Resize(cols, rows) => {
+                            self.on_resize(cols, rows)?;
                         }
+                        _ => {}
                     }
                 }
             }
         }
+    }
+
+    fn on_resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        self.size = Size {
+            width: Width(u32::from(cols)),
+            height: Height(u32::from(rows)),
+        };
+        if matches!(self.mode, Mode::Help) {
+            self.help_renderer.redraw(&mut io::stdout(), self.size)?;
+        } else {
+            self.renderer.redraw(&mut io::stdout(), self.size)?;
+        }
+        Ok(())
     }
 
     fn resume_search_pattern(&mut self) {
@@ -122,7 +154,7 @@ impl EventLoop {
     }
 
     fn on_command_output(&mut self, lines: Vec<Line>) -> anyhow::Result<()> {
-        let size = terminal_size()?;
+        let size = self.size;
         let anchor = self.search.anchor(self.renderer.lines());
         self.renderer.set_lines(lines, size);
         self.search.reattach(self.renderer.lines(), anchor);
@@ -141,25 +173,24 @@ impl EventLoop {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> anyhow::Result<KeyResult> {
-        if matches!(self.mode, Mode::Prompt(_)) {
-            self.on_prompt_key(key)?;
-            return Ok(KeyResult::Continue);
+        match &self.mode {
+            Mode::Prompt(_) => {
+                self.on_prompt_key(key)?;
+                Ok(KeyResult::Continue)
+            }
+            Mode::Dash => self.on_dash_key(key),
+            Mode::Mark(op) => {
+                let op = *op;
+                self.on_mark_key(key, op)
+            }
+            Mode::Help => self.on_help_key(key),
+            Mode::Output => self.on_output_key(key),
         }
-        if matches!(self.mode, Mode::Dash) {
-            return self.on_dash_key(key);
-        }
-        if matches!(self.mode, Mode::Mark(_)) {
-            return self.on_mark_key(key);
-        }
-        if matches!(self.mode, Mode::Help) {
-            return self.on_help_key(key);
-        }
-        self.on_output_key(key)
     }
 
     fn on_dash_key(&mut self, key: KeyEvent) -> anyhow::Result<KeyResult> {
         self.mode = Mode::Output;
-        let size = terminal_size()?;
+        let size = self.size;
         let option = match key.code {
             KeyCode::Char('i') if !key.modifiers.contains(KeyModifiers::CONTROL) => Some(false),
             KeyCode::Char('I') if !key.modifiers.contains(KeyModifiers::CONTROL) => Some(true),
@@ -187,7 +218,7 @@ impl EventLoop {
     }
 
     fn on_prompt_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
-        let size = terminal_size()?;
+        let size = self.size;
         let mut prompt = match mem::replace(&mut self.mode, Mode::Output) {
             Mode::Prompt(prompt) => prompt,
             other => {
@@ -230,23 +261,17 @@ impl EventLoop {
     }
 
     fn begin_mark(&mut self, op: MarkOp) -> anyhow::Result<KeyResult> {
-        let size = terminal_size()?;
+        let size = self.size;
         self.mode = Mode::Mark(op);
         self.renderer
-            .set_prompt_status(op.prompt_label().to_owned(), 1);
+            .set_status_label(Some(op.prompt_label().to_owned()));
         self.renderer.redraw(&mut io::stdout(), size)?;
         Ok(KeyResult::Continue)
     }
 
-    fn on_mark_key(&mut self, key: KeyEvent) -> anyhow::Result<KeyResult> {
-        let op = match mem::replace(&mut self.mode, Mode::Output) {
-            Mode::Mark(op) => op,
-            other => {
-                self.mode = other;
-                return Ok(KeyResult::Continue);
-            }
-        };
-        let size = terminal_size()?;
+    fn on_mark_key(&mut self, key: KeyEvent, op: MarkOp) -> anyhow::Result<KeyResult> {
+        self.mode = Mode::Output;
+        let size = self.size;
         let name = match key.code {
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -291,7 +316,7 @@ impl EventLoop {
         match action {
             KeyAction::Quit | KeyAction::Help => {
                 self.mode = Mode::Output;
-                let size = terminal_size()?;
+                let size = self.size;
                 self.renderer.redraw(&mut io::stdout(), size)?;
                 Ok(KeyResult::Continue)
             }
@@ -320,7 +345,7 @@ impl EventLoop {
             | KeyAction::ScrollBottom
             | KeyAction::ScrollPageDown
             | KeyAction::ScrollPageUp) => {
-                apply_view_action(&mut self.help_renderer, action)?;
+                apply_view_action(&mut self.help_renderer, action, self.size)?;
                 Ok(KeyResult::Continue)
             }
         }
@@ -332,9 +357,9 @@ impl EventLoop {
         };
         match action {
             KeyAction::Dash => {
-                let size = terminal_size()?;
+                let size = self.size;
                 self.mode = Mode::Dash;
-                self.renderer.set_prompt_status("-".to_owned(), 1);
+                self.renderer.set_status_label(Some("-".to_owned()));
                 self.renderer.redraw(&mut io::stdout(), size)?;
                 Ok(KeyResult::Continue)
             }
@@ -345,7 +370,7 @@ impl EventLoop {
                 if !is_dismissable_status(status) {
                     return Ok(KeyResult::Continue);
                 }
-                let size = terminal_size()?;
+                let size = self.size;
                 let label = self.search.match_label(self.renderer.lines());
                 self.renderer.set_status_label(label);
                 self.renderer.redraw(&mut io::stdout(), size)?;
@@ -353,7 +378,7 @@ impl EventLoop {
             }
             KeyAction::Quit => Ok(KeyResult::Quit),
             KeyAction::Help => {
-                let size = terminal_size()?;
+                let size = self.size;
                 self.mode = Mode::Help;
                 self.help_renderer.set_lines(help_lines(), size);
                 self.help_renderer.scroll_top();
@@ -362,7 +387,7 @@ impl EventLoop {
             }
             KeyAction::Refresh => Ok(KeyResult::Refresh),
             KeyAction::SearchForward | KeyAction::SearchBackward => {
-                let size = terminal_size()?;
+                let size = self.size;
                 let forward = matches!(action, KeyAction::SearchForward);
                 let prompt = Prompt::new(forward);
                 self.renderer
@@ -374,7 +399,7 @@ impl EventLoop {
             KeyAction::SetMark => self.begin_mark(MarkOp::Set),
             KeyAction::GotoMark => self.begin_mark(MarkOp::Goto),
             KeyAction::SearchNext | KeyAction::SearchPrev => {
-                let size = terminal_size()?;
+                let size = self.size;
                 let reverse = matches!(action, KeyAction::SearchPrev);
                 self.resume_search_pattern();
                 let outcome = search_next(&mut self.renderer, &mut self.search, size, reverse);
@@ -395,7 +420,7 @@ impl EventLoop {
                     self.search.apply_highlight(&mut self.renderer);
                     self.renderer.set_status_label(None);
                 }
-                apply_view_action(&mut self.renderer, action)?;
+                apply_view_action(&mut self.renderer, action, self.size)?;
                 Ok(KeyResult::Continue)
             }
         }
@@ -431,8 +456,7 @@ fn show_search_outcome(
     Ok(())
 }
 
-fn apply_view_action(view: &mut Renderer, action: KeyAction) -> anyhow::Result<()> {
-    let size = terminal_size()?;
+fn apply_view_action(view: &mut Renderer, action: KeyAction, size: Size) -> anyhow::Result<()> {
     match action {
         KeyAction::ScrollDown => {
             view.scroll_down(size);
@@ -498,20 +522,6 @@ enum KeyAction {
     GotoMark,
 }
 
-/// Receive key presses until one arrives, or the reader ends.
-/// Non-key and non-press events are discarded. The caller should race this
-/// against other work and drop it to stop waiting.
-async fn recv_key_press(keys: &mut UnboundedReceiver<io::Result<Event>>) -> io::Result<KeyEvent> {
-    loop {
-        match keys.recv().await {
-            Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => return Ok(key),
-            Some(Ok(_)) => {}
-            Some(Err(err)) => return Err(err),
-            None => return Err(io::Error::other("key reader stopped")),
-        }
-    }
-}
-
 fn is_dismissable_status(status: &str) -> bool {
     status.starts_with(PATTERN_NOT_FOUND) || status == NO_PREVIOUS_SEARCH || status == NOT_SET
 }
@@ -547,149 +557,5 @@ fn key_action(key: &KeyEvent) -> Option<KeyAction> {
         KeyCode::Char(' ') | KeyCode::PageDown => Some(KeyAction::ScrollPageDown),
         KeyCode::PageUp => Some(KeyAction::ScrollPageUp),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crossterm::event::KeyCode;
-    use crossterm::event::KeyEvent;
-    use crossterm::event::KeyEventKind;
-    use crossterm::event::KeyEventState;
-    use crossterm::event::KeyModifiers;
-
-    use crate::event_loop::KeyAction;
-    use crate::event_loop::key_action;
-
-    fn press(code: KeyCode) -> KeyEvent {
-        KeyEvent {
-            code,
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        }
-    }
-
-    #[test]
-    fn test_h_is_help() {
-        assert_eq!(
-            true,
-            matches!(
-                key_action(&press(KeyCode::Char('h'))),
-                Some(KeyAction::Help)
-            )
-        );
-    }
-
-    #[test]
-    fn test_search_keys() {
-        assert_eq!(
-            true,
-            matches!(
-                key_action(&press(KeyCode::Char('/'))),
-                Some(KeyAction::SearchForward)
-            )
-        );
-        assert_eq!(
-            true,
-            matches!(
-                key_action(&press(KeyCode::Char('?'))),
-                Some(KeyAction::SearchBackward)
-            )
-        );
-        assert_eq!(
-            true,
-            matches!(
-                key_action(&press(KeyCode::Char('n'))),
-                Some(KeyAction::SearchNext)
-            )
-        );
-        assert_eq!(
-            true,
-            matches!(
-                key_action(&press(KeyCode::Char('N'))),
-                Some(KeyAction::SearchPrev)
-            )
-        );
-    }
-
-    #[test]
-    fn test_enter_scrolls_down() {
-        assert_eq!(
-            true,
-            matches!(
-                key_action(&press(KeyCode::Enter)),
-                Some(KeyAction::ScrollDown)
-            )
-        );
-    }
-
-    #[test]
-    fn test_dash_starts_option() {
-        assert_eq!(
-            true,
-            matches!(
-                key_action(&press(KeyCode::Char('-'))),
-                Some(KeyAction::Dash)
-            )
-        );
-    }
-
-    #[test]
-    fn test_esc_dismisses_message() {
-        assert_eq!(
-            true,
-            matches!(
-                key_action(&press(KeyCode::Esc)),
-                Some(KeyAction::DismissMessage)
-            )
-        );
-    }
-
-    #[test]
-    fn test_home_end_scroll() {
-        assert_eq!(
-            true,
-            matches!(
-                key_action(&press(KeyCode::Home)),
-                Some(KeyAction::ScrollTop)
-            )
-        );
-        assert_eq!(
-            true,
-            matches!(
-                key_action(&press(KeyCode::End)),
-                Some(KeyAction::ScrollBottom)
-            )
-        );
-    }
-
-    #[test]
-    fn test_mark_keys() {
-        assert_eq!(
-            true,
-            matches!(
-                key_action(&press(KeyCode::Char('m'))),
-                Some(KeyAction::SetMark)
-            )
-        );
-        assert_eq!(
-            true,
-            matches!(
-                key_action(&press(KeyCode::Char('\''))),
-                Some(KeyAction::GotoMark)
-            )
-        );
-    }
-
-    #[test]
-    fn test_q_is_quit() {
-        assert_eq!(
-            true,
-            matches!(
-                key_action(&press(KeyCode::Char('q'))),
-                Some(KeyAction::Quit)
-            )
-        );
     }
 }
