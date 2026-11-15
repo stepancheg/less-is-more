@@ -8,6 +8,9 @@ pub(crate) struct Prompt {
     query: String,
     /// Byte offset into `query`, always on a char boundary.
     cursor: usize,
+    /// Index into the history list while walking it, or the draft line.
+    history_pos: Option<usize>,
+    draft: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,6 +28,8 @@ impl Prompt {
             forward,
             query: String::new(),
             cursor: 0,
+            history_pos: None,
+            draft: String::new(),
         }
     }
 
@@ -59,7 +64,7 @@ impl Prompt {
         cols
     }
 
-    pub(crate) fn on_key(&mut self, key: &KeyEvent) -> PromptOutcome {
+    pub(crate) fn on_key(&mut self, key: &KeyEvent, history: &[String]) -> PromptOutcome {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             if let KeyCode::Char(c) = key.code {
                 match c {
@@ -94,6 +99,26 @@ impl Prompt {
         match key.code {
             KeyCode::Enter => PromptOutcome::Submit,
             KeyCode::Esc => PromptOutcome::Cancel,
+            KeyCode::Up
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if self.history_up(history) {
+                    PromptOutcome::Editing
+                } else {
+                    PromptOutcome::Ignore
+                }
+            }
+            KeyCode::Down
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if self.history_down(history) {
+                    PromptOutcome::Editing
+                } else {
+                    PromptOutcome::Ignore
+                }
+            }
             KeyCode::Backspace => {
                 if self.cursor == 0 {
                     if self.query.is_empty() {
@@ -119,6 +144,43 @@ impl Prompt {
             }
             _ => PromptOutcome::Ignore,
         }
+    }
+
+    fn history_up(&mut self, history: &[String]) -> bool {
+        if history.is_empty() {
+            return false;
+        }
+        let next = match self.history_pos {
+            None => {
+                self.draft = std::mem::take(&mut self.query);
+                history.len() - 1
+            }
+            Some(0) => return false,
+            Some(i) => i - 1,
+        };
+        self.history_pos = Some(next);
+        self.replace_query(history[next].clone());
+        true
+    }
+
+    fn history_down(&mut self, history: &[String]) -> bool {
+        let Some(i) = self.history_pos else {
+            return false;
+        };
+        if i + 1 < history.len() {
+            self.history_pos = Some(i + 1);
+            self.replace_query(history[i + 1].clone());
+        } else {
+            self.history_pos = None;
+            let draft = std::mem::take(&mut self.draft);
+            self.replace_query(draft);
+        }
+        true
+    }
+
+    fn replace_query(&mut self, query: String) {
+        self.cursor = query.len();
+        self.query = query;
     }
 
     /// Readline unix-word-rubout: delete the whitespace and word before the caret.
@@ -221,21 +283,21 @@ mod tests {
         assert_eq!("/", prompt.status_label());
         assert_eq!(
             PromptOutcome::Editing,
-            prompt.on_key(&press(KeyCode::Char('a'), KeyModifiers::NONE))
+            prompt.on_key(&press(KeyCode::Char('a'), KeyModifiers::NONE), &[])
         );
         assert_eq!(
             PromptOutcome::Editing,
-            prompt.on_key(&press(KeyCode::Char('b'), KeyModifiers::NONE))
+            prompt.on_key(&press(KeyCode::Char('b'), KeyModifiers::NONE), &[])
         );
         assert_eq!("/ab", prompt.status_label());
         assert_eq!(
             PromptOutcome::Editing,
-            prompt.on_key(&press(KeyCode::Backspace, KeyModifiers::NONE))
+            prompt.on_key(&press(KeyCode::Backspace, KeyModifiers::NONE), &[])
         );
         assert_eq!("/a", prompt.status_label());
         assert_eq!(
             PromptOutcome::Submit,
-            prompt.on_key(&press(KeyCode::Enter, KeyModifiers::NONE))
+            prompt.on_key(&press(KeyCode::Enter, KeyModifiers::NONE), &[])
         );
         assert_eq!("a", prompt.take_query());
     }
@@ -244,38 +306,38 @@ mod tests {
     fn test_prompt_readline_keys() {
         let mut prompt = Prompt::new(true);
         for c in ['f', 'o', 'o', ' ', 'b', 'a', 'r'] {
-            prompt.on_key(&press(KeyCode::Char(c), KeyModifiers::NONE));
+            prompt.on_key(&press(KeyCode::Char(c), KeyModifiers::NONE), &[]);
         }
         assert_eq!("/foo bar", prompt.status_label());
         assert_eq!(
             PromptOutcome::Editing,
-            prompt.on_key(&press(KeyCode::Char('a'), KeyModifiers::CONTROL))
+            prompt.on_key(&press(KeyCode::Char('a'), KeyModifiers::CONTROL), &[])
         );
         assert_eq!(1, prompt.caret_cols());
         assert_eq!(
             PromptOutcome::Editing,
-            prompt.on_key(&press(KeyCode::Char('x'), KeyModifiers::NONE))
+            prompt.on_key(&press(KeyCode::Char('x'), KeyModifiers::NONE), &[])
         );
         assert_eq!("/xfoo bar", prompt.status_label());
         assert_eq!(
             PromptOutcome::Editing,
-            prompt.on_key(&press(KeyCode::Char('e'), KeyModifiers::CONTROL))
+            prompt.on_key(&press(KeyCode::Char('e'), KeyModifiers::CONTROL), &[])
         );
         assert_eq!(9, prompt.caret_cols());
         assert_eq!(
             PromptOutcome::Editing,
-            prompt.on_key(&press(KeyCode::Char('w'), KeyModifiers::CONTROL))
+            prompt.on_key(&press(KeyCode::Char('w'), KeyModifiers::CONTROL), &[])
         );
         assert_eq!("/xfoo ", prompt.status_label());
         assert_eq!(
             PromptOutcome::Editing,
-            prompt.on_key(&press(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            prompt.on_key(&press(KeyCode::Char('u'), KeyModifiers::CONTROL), &[])
         );
         assert_eq!("/", prompt.status_label());
         assert_eq!(1, prompt.caret_cols());
         assert_eq!(
             PromptOutcome::Ignore,
-            prompt.on_key(&press(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            prompt.on_key(&press(KeyCode::Char('u'), KeyModifiers::CONTROL), &[])
         );
     }
 
@@ -285,19 +347,72 @@ mod tests {
         assert_eq!("?", prompt.status_label());
         assert_eq!(
             PromptOutcome::Cancel,
-            prompt.on_key(&press(KeyCode::Backspace, KeyModifiers::NONE))
+            prompt.on_key(&press(KeyCode::Backspace, KeyModifiers::NONE), &[])
         );
         assert_eq!(
             PromptOutcome::Cancel,
-            prompt.on_key(&press(KeyCode::Esc, KeyModifiers::NONE))
+            prompt.on_key(&press(KeyCode::Esc, KeyModifiers::NONE), &[])
         );
         assert_eq!(
             PromptOutcome::Cancel,
-            prompt.on_key(&press(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            prompt.on_key(&press(KeyCode::Char('c'), KeyModifiers::CONTROL), &[])
         );
         assert_eq!(
             PromptOutcome::Redraw,
-            prompt.on_key(&press(KeyCode::Char('l'), KeyModifiers::CONTROL))
+            prompt.on_key(&press(KeyCode::Char('l'), KeyModifiers::CONTROL), &[])
         );
+    }
+
+    #[test]
+    fn test_prompt_history_up_down() {
+        let mut entries = Vec::new();
+        entries.push("one".to_owned());
+        entries.push("two".to_owned());
+        entries.push("three".to_owned());
+        let mut prompt = Prompt::new(true);
+        assert_eq!(
+            PromptOutcome::Editing,
+            prompt.on_key(&press(KeyCode::Char('x'), KeyModifiers::NONE), &entries)
+        );
+        assert_eq!(
+            PromptOutcome::Editing,
+            prompt.on_key(&press(KeyCode::Up, KeyModifiers::NONE), &entries)
+        );
+        assert_eq!("/three", prompt.status_label());
+        assert_eq!(
+            PromptOutcome::Editing,
+            prompt.on_key(&press(KeyCode::Up, KeyModifiers::NONE), &entries)
+        );
+        assert_eq!("/two", prompt.status_label());
+        assert_eq!(
+            PromptOutcome::Editing,
+            prompt.on_key(&press(KeyCode::Up, KeyModifiers::NONE), &entries)
+        );
+        assert_eq!("/one", prompt.status_label());
+        assert_eq!(
+            PromptOutcome::Ignore,
+            prompt.on_key(&press(KeyCode::Up, KeyModifiers::NONE), &entries)
+        );
+        assert_eq!("/one", prompt.status_label());
+        assert_eq!(
+            PromptOutcome::Editing,
+            prompt.on_key(&press(KeyCode::Down, KeyModifiers::NONE), &entries)
+        );
+        assert_eq!("/two", prompt.status_label());
+        assert_eq!(
+            PromptOutcome::Editing,
+            prompt.on_key(&press(KeyCode::Down, KeyModifiers::NONE), &entries)
+        );
+        assert_eq!("/three", prompt.status_label());
+        assert_eq!(
+            PromptOutcome::Editing,
+            prompt.on_key(&press(KeyCode::Down, KeyModifiers::NONE), &entries)
+        );
+        assert_eq!("/x", prompt.status_label());
+        assert_eq!(
+            PromptOutcome::Ignore,
+            prompt.on_key(&press(KeyCode::Down, KeyModifiers::NONE), &entries)
+        );
+        assert_eq!("/x", prompt.status_label());
     }
 }

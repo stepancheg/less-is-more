@@ -22,7 +22,8 @@ Keys
   ^l             Redraw
 
 q or h closes this page.
-In the prompt, Enter searches. Esc cancels it or clears Pattern not found.
+In the prompt, Enter searches. Up and Down recall previous searches.
+Esc cancels the prompt or clears Pattern not found.
 ";
 
 pub(crate) fn help_lines() -> Vec<Line> {
@@ -62,6 +63,7 @@ mod tests {
             text.contains("?              Search backward from the bottom of the screen")
         );
         assert_eq!(true, text.contains("n              Repeat search"));
+        assert_eq!(true, text.contains("Up and Down recall previous searches."));
     }
 
     #[test]

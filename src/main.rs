@@ -33,6 +33,7 @@ use crate::event_loop::EventLoop;
 use crate::interval_arg::IntervalArg;
 use crate::notify_pair::NotifyRx;
 use crate::notify_pair::NotifyTx;
+use crate::search::history::store::History;
 use crate::terminal::line::Line;
 use crate::terminal::parse::parse_command_output;
 use crate::terminal_bg::query_terminal_bg;
@@ -58,14 +59,10 @@ fn install_panic_hook() {
     }));
 }
 
-fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-    run(args)?;
-    Ok(())
-}
-
 #[tokio::main(flavor = "current_thread")]
-async fn run(args: Args) -> anyhow::Result<()> {
+async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    let history = History::load_from_home().await;
     install_panic_hook();
     // Query before raw mode; the color query reads a terminal response.
     let terminal_bg = query_terminal_bg();
@@ -86,7 +83,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         refresh_rx,
     ));
 
-    EventLoop::new(terminal_bg)
+    EventLoop::new(terminal_bg, history)
         .run(output_rx, keys, refresh_tx, capture_task)
         .await
 }

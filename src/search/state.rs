@@ -105,6 +105,17 @@ impl Search {
         self.current = None;
     }
 
+    pub(crate) fn resume_from_history(&mut self, entries: &[String]) {
+        if !self.pattern.is_empty() {
+            return;
+        }
+        if let Some(last) = entries.last() {
+            if !last.is_empty() {
+                self.pattern = last.clone();
+            }
+        }
+    }
+
     /// Remember which hit is selected, before the lines are replaced.
     pub(crate) fn anchor(&self, lines: &[Line]) -> Option<MatchAnchor> {
         let (line, byte) = self.current?;

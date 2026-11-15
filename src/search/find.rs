@@ -458,6 +458,80 @@ mod tests {
     }
 
     #[test]
+    fn test_search_next_after_move_restarts_from_screen_edge() {
+        let mut renderer = Renderer::new(TerminalBg::Dark);
+        // Content height is 5; three pages of hits.
+        let size = size(20, 6);
+        renderer.set_lines(
+            parse_command_output(b"hit0\nx\nx\nx\nx\nhit1\nx\nx\nx\nx\nhit2\n"),
+            size,
+        );
+        let mut search = Search::new();
+        assert_eq!(
+            SearchOutcome::Found,
+            submit_prompt(&mut renderer, &mut search, size, true, "hit".to_owned())
+        );
+        assert_eq!(
+            Some("[1/3]".to_owned()),
+            search.match_label(renderer.lines())
+        );
+        // Move to the last page, dropping the selected hit as a scroll does.
+        renderer.scroll_bottom(size);
+        search.clear_match();
+        assert_eq!(
+            SearchOutcome::Found,
+            search_next(&mut renderer, &mut search, size, false)
+        );
+        // Forward restart begins at the top of the screen, not after hit0.
+        assert_eq!(
+            Some("[3/3]".to_owned()),
+            search.match_label(renderer.lines())
+        );
+
+        // Backward restart begins at the bottom of the screen.
+        renderer.scroll_top();
+        search.clear_match();
+        search.forward = false;
+        assert_eq!(
+            SearchOutcome::Found,
+            search_next(&mut renderer, &mut search, size, false)
+        );
+        assert_eq!(
+            Some("[1/3]".to_owned()),
+            search.match_label(renderer.lines())
+        );
+    }
+
+    #[test]
+    fn test_search_next_resumes_last_history_pattern() {
+        let mut renderer = Renderer::new(TerminalBg::Dark);
+        let size = size(10, 6);
+        renderer.set_lines(parse_command_output(b"a\nfoo\nb\n"), size);
+        let mut search = Search::new();
+        assert_eq!(
+            SearchOutcome::NoPattern,
+            search_next(&mut renderer, &mut search, size, false)
+        );
+        let mut entries = Vec::new();
+        entries.push("old".to_owned());
+        entries.push("foo".to_owned());
+        search.resume_from_history(&entries);
+        assert_eq!(
+            SearchOutcome::Found,
+            search_next(&mut renderer, &mut search, size, false)
+        );
+        assert_eq!(
+            Some("[1/1]".to_owned()),
+            search.match_label(renderer.lines())
+        );
+        // An in-session pattern is left alone.
+        let mut other = Vec::new();
+        other.push("bar".to_owned());
+        search.resume_from_history(&other);
+        assert_eq!("foo", search.pattern);
+    }
+
+    #[test]
     fn test_not_found_does_not_move() {
         let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = size(10, 3);

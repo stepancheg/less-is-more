@@ -17,6 +17,7 @@ use crate::render::terminal_size;
 use crate::search::find::SearchOutcome;
 use crate::search::find::search_next;
 use crate::search::find::submit_prompt;
+use crate::search::history::store::History;
 use crate::search::prompt::Prompt;
 use crate::search::prompt::PromptOutcome;
 use crate::search::state::NO_PREVIOUS_SEARCH;
@@ -46,20 +47,34 @@ pub(crate) struct EventLoop {
     renderer: Renderer,
     help_renderer: Renderer,
     search: Search,
+    history: History,
     mode: Mode,
 }
 
 impl EventLoop {
-    pub(crate) fn new(terminal_bg: TerminalBg) -> EventLoop {
+    pub(crate) fn new(terminal_bg: TerminalBg, history: History) -> EventLoop {
         EventLoop {
             renderer: Renderer::new(terminal_bg),
             help_renderer: Renderer::new(terminal_bg),
             search: Search::new(),
+            history,
             mode: Mode::Output,
         }
     }
 
     pub(crate) async fn run(
+        &mut self,
+        output_rx: Receiver<Vec<Line>>,
+        keys: UnboundedReceiver<io::Result<Event>>,
+        refresh_tx: NotifyTx,
+        capture_task: AbortOnDropHandle<()>,
+    ) -> anyhow::Result<()> {
+        let result = self.drive(output_rx, keys, refresh_tx, capture_task).await;
+        self.history.shutdown().await;
+        result
+    }
+
+    async fn drive(
         &mut self,
         mut output_rx: Receiver<Vec<Line>>,
         mut keys: UnboundedReceiver<io::Result<Event>>,
@@ -92,6 +107,11 @@ impl EventLoop {
                 }
             }
         }
+    }
+
+    fn resume_search_pattern(&mut self) {
+        let entries = self.history.entries();
+        self.search.resume_from_history(entries);
     }
 
     fn on_command_output(&mut self, lines: Vec<Line>) -> anyhow::Result<()> {
@@ -165,7 +185,7 @@ impl EventLoop {
                 return Ok(());
             }
         };
-        match prompt.on_key(&key) {
+        match prompt.on_key(&key, self.history.entries()) {
             PromptOutcome::Editing => {
                 self.renderer
                     .set_prompt_status(prompt.status_label(), prompt.caret_cols());
@@ -187,6 +207,10 @@ impl EventLoop {
             PromptOutcome::Submit => {
                 let forward = prompt.forward();
                 let query = prompt.take_query();
+                self.history.record(&query);
+                if query.is_empty() {
+                    self.resume_search_pattern();
+                }
                 let outcome =
                     submit_prompt(&mut self.renderer, &mut self.search, size, forward, query);
                 show_search_outcome(&mut self.renderer, &self.search, outcome, size)?;
@@ -283,6 +307,7 @@ impl EventLoop {
             KeyAction::SearchNext | KeyAction::SearchPrev => {
                 let size = terminal_size()?;
                 let reverse = matches!(action, KeyAction::SearchPrev);
+                self.resume_search_pattern();
                 let outcome = search_next(&mut self.renderer, &mut self.search, size, reverse);
                 show_search_outcome(&mut self.renderer, &self.search, outcome, size)?;
                 Ok(KeyResult::Continue)
@@ -295,8 +320,11 @@ impl EventLoop {
             | KeyAction::ScrollPageDown
             | KeyAction::ScrollPageUp) => {
                 if !matches!(action, KeyAction::Redraw) {
-                    let label = self.search.match_label(self.renderer.lines());
-                    self.renderer.set_status_label(label);
+                    // Drop the selected hit so the next n/N searches from
+                    // the screen edge, like a fresh / or ?.
+                    self.search.clear_match();
+                    self.search.apply_highlight(&mut self.renderer);
+                    self.renderer.set_status_label(None);
                 }
                 apply_view_action(&mut self.renderer, action)?;
                 Ok(KeyResult::Continue)
