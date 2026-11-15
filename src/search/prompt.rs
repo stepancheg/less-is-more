@@ -257,6 +257,14 @@ mod tests {
     use crate::terminal::width::Width;
     use crate::terminal_bg::TerminalBg;
 
+    fn vt_parser(rows: u16, cols: u16) -> vt100::Parser {
+        vt100::Parser::new(
+            std::num::NonZeroU16::new(rows).unwrap(),
+            std::num::NonZeroU16::new(cols).unwrap(),
+            0,
+        )
+    }
+
     fn size(width: u32, height: u32) -> Size {
         Size {
             width: Width(width),
@@ -281,7 +289,7 @@ mod tests {
         renderer.set_status_label(Some("/foo".to_owned()));
         let mut buf = Vec::new();
         renderer.draw(&mut buf, size).unwrap();
-        let mut parser = vt100::Parser::new(3, 10, 0);
+        let mut parser = vt_parser(3, 10);
         parser.process(&buf);
         let mut text = String::new();
         for col in 0..10 {

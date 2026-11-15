@@ -23,12 +23,16 @@ use crate::search::find::submit_prompt;
 use crate::search::history::store::History;
 use crate::search::prompt::Prompt;
 use crate::search::prompt::PromptOutcome;
+use crate::search::state::CaseMode;
+use crate::search::state::INVALID_PATTERN;
 use crate::search::state::NO_PREVIOUS_SEARCH;
 use crate::search::state::PATTERN_NOT_FOUND;
 use crate::search::state::Search;
 use crate::search::state::status_after_output;
 use crate::size::Size;
 use crate::terminal::line::Line;
+use crate::terminal::line::compile_search;
+use crate::terminal::line::fold_case;
 use crate::terminal::width::Width;
 use crate::terminal_bg::TerminalBg;
 
@@ -271,9 +275,18 @@ impl EventLoop {
             PromptOutcome::Submit => {
                 let forward = prompt.forward();
                 let query = prompt.take_query();
-                self.history.record(&query);
                 if query.is_empty() {
                     self.resume_search_pattern();
+                } else {
+                    let mode = self.search.case_mode();
+                    let fold = fold_case(
+                        &query,
+                        mode == CaseMode::IgnoreCase,
+                        mode == CaseMode::IgnoreCaseAlways,
+                    );
+                    if compile_search(&query, fold).is_ok() {
+                        self.history.record(&query);
+                    }
                 }
                 let outcome =
                     submit_prompt(&mut self.renderer, &mut self.search, size, forward, query);
@@ -474,6 +487,9 @@ fn show_search_outcome(
         SearchOutcome::NoPattern => {
             renderer.set_status_label(Some(NO_PREVIOUS_SEARCH.to_owned()));
         }
+        SearchOutcome::InvalidPattern => {
+            renderer.set_status_label(Some(INVALID_PATTERN.to_owned()));
+        }
     }
     renderer.redraw(&mut io::stdout(), size)?;
     Ok(())
@@ -546,7 +562,10 @@ enum KeyAction {
 }
 
 fn is_dismissable_status(status: &str) -> bool {
-    status.starts_with(PATTERN_NOT_FOUND) || status == NO_PREVIOUS_SEARCH || status == NOT_SET
+    status.starts_with(PATTERN_NOT_FOUND)
+        || status == NO_PREVIOUS_SEARCH
+        || status == INVALID_PATTERN
+        || status == NOT_SET
 }
 
 fn key_action(key: &KeyEvent) -> Option<KeyAction> {

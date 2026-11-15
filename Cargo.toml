@@ -10,6 +10,7 @@ crossterm = "0.29.0"
 derive_more = { version = "2.1", features = ["display", "add", "add_assign", "sum"] }
 libc = "0.2.191"
 ref-cast = "1.0.27"
+regex = "1.12.2"
 terminal-colorsaurus = "1.0.3"
 tokio = { version = "1.54.1", features = ["rt", "macros", "process", "time", "sync", "net", "fs", "io-util"] }
 unicode-segmentation = "1"
@@ -23,4 +24,4 @@ panic = "abort"
 
 [dev-dependencies]
 tempfile = "3.27.0"
-vt100 = "0.16.2"
+vt100 = "0.18.1"

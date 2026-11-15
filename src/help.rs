@@ -13,8 +13,8 @@ Keys
   PgUp           Page up
   g, Home        Top
   G, End         Bottom
-  /              Search forward from the top of the screen
-  ?              Search backward from the bottom of the screen
+  /              Regex search forward from the top of the screen
+  ?              Regex search backward from the bottom of the screen
   n              Repeat search
   N              Repeat search in reverse
   mx             Mark current position as x
@@ -41,6 +41,14 @@ mod tests {
     use crate::terminal::width::Width;
     use crate::terminal_bg::TerminalBg;
 
+    fn vt_parser(rows: u16, cols: u16) -> vt100::Parser {
+        vt100::Parser::new(
+            std::num::NonZeroU16::new(rows).unwrap(),
+            std::num::NonZeroU16::new(cols).unwrap(),
+            0,
+        )
+    }
+
     #[test]
     fn test_help_lists_keys() {
         let text: String = help_lines()
@@ -62,11 +70,11 @@ mod tests {
         assert_eq!(true, text.contains("q or h closes this page."));
         assert_eq!(
             true,
-            text.contains("/              Search forward from the top of the screen")
+            text.contains("/              Regex search forward from the top of the screen")
         );
         assert_eq!(
             true,
-            text.contains("?              Search backward from the bottom of the screen")
+            text.contains("?              Regex search backward from the bottom of the screen")
         );
         assert_eq!(true, text.contains("g, Home        Top"));
         assert_eq!(true, text.contains("G, End         Bottom"));
@@ -89,7 +97,7 @@ mod tests {
         renderer.set_lines(help_lines(), size);
         let mut buf = Vec::new();
         renderer.draw(&mut buf, size).unwrap();
-        let mut parser = vt100::Parser::new(30, 80, 0);
+        let mut parser = vt_parser(30, 80);
         parser.process(&buf);
         assert_eq!(true, parser.screen().contents().contains("Show this help"));
         let mut ruler = String::new();

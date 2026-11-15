@@ -13,6 +13,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::height::Height;
 use crate::size::Size;
 use crate::terminal::line::Line;
+use crate::terminal::line::compile_search;
 use crate::terminal::width::Width;
 use crate::terminal_bg::TerminalBg;
 use crate::theme::search_highlight;
@@ -41,7 +42,7 @@ pub(crate) struct Renderer {
     status_label: Option<String>,
     /// Caret column in `status_label`. `None` means the end of the label.
     status_caret: Option<u32>,
-    /// Literal pattern whose matches are drawn with a search highlight.
+    /// Compiled search regex whose matches are drawn with a search highlight.
     highlight: Option<Highlight>,
     /// Bumped when body rows may have changed (`set_lines` / highlight).
     content_gen: u64,
@@ -49,9 +50,8 @@ pub(crate) struct Renderer {
 
 /// Active search highlight. `current` is the selected match's line and byte offset.
 struct Highlight {
-    pattern: String,
+    regex: regex::Regex,
     current: Option<(usize, usize)>,
-    ignore_case: bool,
 }
 
 struct DrawnFrame {
@@ -87,11 +87,12 @@ impl Renderer {
     ) {
         self.content_gen = self.content_gen.wrapping_add(1);
         self.highlight = match pattern {
-            Some(pattern) if !pattern.is_empty() => Some(Highlight {
-                pattern,
-                current,
-                ignore_case,
-            }),
+            Some(pattern) if !pattern.is_empty() => {
+                match compile_search(&pattern, ignore_case) {
+                    Ok(regex) => Some(Highlight { regex, current }),
+                    Err(_) => None,
+                }
+            }
             _ => None,
         };
     }
@@ -765,7 +766,7 @@ fn line_visual_rows(
         return rows;
     }
     let ranges = match highlight {
-        Some(highlight) => line.match_ranges(&highlight.pattern, highlight.ignore_case),
+        Some(highlight) => line.match_ranges(&highlight.regex),
         None => Vec::new(),
     };
     let current_byte = match highlight {
@@ -856,6 +857,14 @@ mod tests {
     use crate::theme::NVIM_DARK_YELLOW;
     use crate::theme::NVIM_LIGHT_YELLOW;
 
+    fn vt_parser(rows: u16, cols: u16) -> vt100::Parser {
+        vt100::Parser::new(
+            std::num::NonZeroU16::new(rows).unwrap(),
+            std::num::NonZeroU16::new(cols).unwrap(),
+            0,
+        )
+    }
+
     fn vt_color(color: TerminalColor) -> vt100::Color {
         match color {
             TerminalColor::Rgb(r, g, b) => vt100::Color::Rgb(r, g, b),
@@ -879,7 +888,7 @@ mod tests {
         }
         let mut buf = Vec::new();
         renderer.draw(&mut buf, size).unwrap();
-        let mut parser = vt100::Parser::new(height, width, 0);
+        let mut parser = vt_parser(height, width);
         parser.process(&buf);
         parser
     }
@@ -984,7 +993,7 @@ mod tests {
         renderer.scroll_bottom(size(10, 3));
         let mut buf = Vec::new();
         renderer.draw(&mut buf, size(10, 3)).unwrap();
-        let mut parser = vt100::Parser::new(3, 10, 0);
+        let mut parser = vt_parser(3, 10);
         parser.process(&buf);
         assert_eq!("c", row_text(&parser, 0, 10));
         assert_eq!("d", row_text(&parser, 1, 10));
@@ -992,7 +1001,7 @@ mod tests {
         renderer.scroll_top();
         buf.clear();
         renderer.draw(&mut buf, size(10, 3)).unwrap();
-        let mut parser = vt100::Parser::new(3, 10, 0);
+        let mut parser = vt_parser(3, 10);
         parser.process(&buf);
         assert_eq!("a", row_text(&parser, 0, 10));
         assert_eq!("b", row_text(&parser, 1, 10));
@@ -1016,7 +1025,7 @@ mod tests {
         renderer.scroll_down(size(5, 3));
         let mut buf = Vec::new();
         renderer.draw(&mut buf, size(5, 3)).unwrap();
-        let mut parser = vt100::Parser::new(3, 5, 0);
+        let mut parser = vt_parser(3, 5);
         parser.process(&buf);
         assert_eq!("abcde", row_text(&parser, 0, 5));
         // Width 8 wraps that line into 01234567/89abcdef/ghij. Byte 10
@@ -1024,7 +1033,7 @@ mod tests {
         // show "ghij" instead.
         buf.clear();
         renderer.draw(&mut buf, size(8, 3)).unwrap();
-        let mut parser = vt100::Parser::new(3, 8, 0);
+        let mut parser = vt_parser(3, 8);
         parser.process(&buf);
         assert_eq!("89abcdef", row_text(&parser, 0, 8));
     }
@@ -1036,7 +1045,7 @@ mod tests {
         renderer.scroll_page_down(size(10, 3));
         let mut buf = Vec::new();
         renderer.draw(&mut buf, size(10, 3)).unwrap();
-        let mut parser = vt100::Parser::new(3, 10, 0);
+        let mut parser = vt_parser(3, 10);
         parser.process(&buf);
         assert_eq!("c", row_text(&parser, 0, 10));
         assert_eq!("d", row_text(&parser, 1, 10));
@@ -1044,7 +1053,7 @@ mod tests {
         renderer.scroll_page_up(size(10, 3));
         buf.clear();
         renderer.draw(&mut buf, size(10, 3)).unwrap();
-        let mut parser = vt100::Parser::new(3, 10, 0);
+        let mut parser = vt_parser(3, 10);
         parser.process(&buf);
         assert_eq!("a", row_text(&parser, 0, 10));
         assert_eq!("b", row_text(&parser, 1, 10));
@@ -1143,7 +1152,7 @@ mod tests {
         renderer.set_highlight(Some("FOO".to_owned()), Some((0, 2)), false);
         let mut buf = Vec::new();
         renderer.draw(&mut buf, size).unwrap();
-        let mut parser = vt100::Parser::new(3, 20, 0);
+        let mut parser = vt_parser(3, 20);
         parser.process(&buf);
         assert_eq!("xxFOOyy", row_text(&parser, 0, 20));
         let plain = |col: u16| parser.screen().cell(0, col).unwrap();
@@ -1203,7 +1212,7 @@ mod tests {
         renderer.set_lines(parse_command_output(b"a\n"), size(10, 2));
         let mut buf = Vec::new();
         renderer.draw(&mut buf, size(10, 2)).unwrap();
-        let mut parser = vt100::Parser::new(2, 10, 0);
+        let mut parser = vt_parser(2, 10);
         parser.process(&buf);
         assert_eq!("       Bot", row_text(&parser, 1, 10));
         let cell = parser.screen().cell(1, 0).unwrap();

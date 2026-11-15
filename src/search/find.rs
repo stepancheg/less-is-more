@@ -1,13 +1,17 @@
 use crate::render::Renderer;
+use crate::search::state::CaseMode;
 use crate::search::state::Search;
 use crate::size::Size;
 use crate::terminal::line::Line;
+use crate::terminal::line::compile_search;
+use crate::terminal::line::fold_case;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SearchOutcome {
     Found,
     NotFound,
     NoPattern,
+    InvalidPattern,
 }
 
 #[derive(Clone, Copy)]
@@ -30,7 +34,15 @@ pub(crate) fn run_search(
         renderer.set_highlight(None, None, false);
         return SearchOutcome::NoPattern;
     }
-    let occs = occurrences(renderer.lines(), &search.pattern, search.folds_pattern());
+    let ignore_case = search.folds_pattern();
+    let re = match compile_search(&search.pattern, ignore_case) {
+        Ok(re) => re,
+        Err(_) => {
+            renderer.set_highlight(None, None, false);
+            return SearchOutcome::InvalidPattern;
+        }
+    };
+    let occs = occurrences_with(renderer.lines(), &re);
     let picked = pick_occurrence(renderer, search, size, &occs, forward, repeat);
     match picked {
         Some(idx) => {
@@ -64,6 +76,15 @@ pub(crate) fn submit_prompt(
             return SearchOutcome::NoPattern;
         }
     } else {
+        let mode = search.case_mode();
+        let ignore_case = fold_case(
+            &query,
+            mode == CaseMode::IgnoreCase,
+            mode == CaseMode::IgnoreCaseAlways,
+        );
+        if compile_search(&query, ignore_case).is_err() {
+            return SearchOutcome::InvalidPattern;
+        }
         search.pattern = query;
     }
     search.forward = forward;
@@ -85,12 +106,19 @@ pub(crate) fn search_next(
 }
 
 pub(crate) fn occurrences(lines: &[Line], pattern: &str, ignore_case: bool) -> Vec<Occurrence> {
-    let mut occs = Vec::new();
     if pattern.is_empty() {
-        return occs;
+        return Vec::new();
     }
+    let Ok(re) = compile_search(pattern, ignore_case) else {
+        return Vec::new();
+    };
+    occurrences_with(lines, &re)
+}
+
+fn occurrences_with(lines: &[Line], re: &regex::Regex) -> Vec<Occurrence> {
+    let mut occs = Vec::new();
     for (line, text) in lines.iter().enumerate() {
-        for (byte_start, _) in text.match_ranges(pattern, ignore_case) {
+        for (byte_start, _) in text.match_ranges(re) {
             occs.push(Occurrence { line, byte_start });
         }
     }
@@ -173,7 +201,10 @@ pub(crate) fn find_backward(lines: &[Line], pattern: &str, start: usize) -> Opti
 
 #[cfg_attr(not(test), expect(dead_code))]
 fn line_contains(line: &Line, pattern: &str) -> bool {
-    line.plain_text().contains(pattern)
+    match compile_search(pattern, false) {
+        Ok(re) => !line.match_ranges(&re).is_empty(),
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +224,14 @@ mod tests {
     use crate::terminal_bg::TerminalBg;
     use crate::theme::NVIM_LIGHT_YELLOW;
     use crate::wrapped_row::WrappedRow;
+
+    fn vt_parser(rows: u16, cols: u16) -> vt100::Parser {
+        vt100::Parser::new(
+            std::num::NonZeroU16::new(rows).unwrap(),
+            std::num::NonZeroU16::new(cols).unwrap(),
+            0,
+        )
+    }
 
     fn size(width: u32, height: u32) -> Size {
         Size {
@@ -223,6 +262,36 @@ mod tests {
     fn test_find_spans_style_boundary() {
         let lines = parse_command_output(b"a\x1b[31mb\x1b[0mc\n");
         assert_eq!(Some(0), find_forward(&lines, "abc", 0));
+    }
+
+    #[test]
+    fn test_find_regex_dot() {
+        let lines = parse_command_output(b"foo\nfao\nf\no\n");
+        assert_eq!(Some(0), find_forward(&lines, "f.o", 0));
+        assert_eq!(Some(1), find_forward(&lines, "f.o", 1));
+        assert_eq!(None, find_forward(&lines, "f.o", 2));
+    }
+
+    #[test]
+    fn test_invalid_pattern() {
+        let mut renderer = Renderer::new(TerminalBg::Dark);
+        let size = size(10, 4);
+        renderer.set_lines(parse_command_output(b"foo\n"), size);
+        let mut search = Search::new();
+        assert_eq!(
+            SearchOutcome::Found,
+            submit_prompt(&mut renderer, &mut search, size, true, "foo".to_owned())
+        );
+        assert_eq!(
+            SearchOutcome::InvalidPattern,
+            submit_prompt(&mut renderer, &mut search, size, true, "[".to_owned())
+        );
+        // Previous pattern is kept.
+        assert_eq!("foo", search.pattern);
+        assert_eq!(
+            Some("[1/1]".to_owned()),
+            search.match_label(renderer.lines())
+        );
     }
 
     #[test]
@@ -418,7 +487,7 @@ mod tests {
 
         let mut buf = Vec::new();
         renderer.draw(&mut buf, size).unwrap();
-        let mut parser = vt100::Parser::new(6, 20, 0);
+        let mut parser = vt_parser(6, 20);
         parser.process(&buf);
         // Current match is the "foo" on logical line 2, still on screen.
         let cell = parser.screen().cell(2, 0).unwrap();

@@ -7,6 +7,7 @@ use crate::terminal::line::fold_case;
 
 pub(crate) const PATTERN_NOT_FOUND: &str = "Pattern not found";
 pub(crate) const NO_PREVIOUS_SEARCH: &str = "No previous search";
+pub(crate) const INVALID_PATTERN: &str = "Invalid pattern";
 
 /// Status line to show after a command-output refresh.
 /// "Pattern not found" and the `-i`/`-I` case-mode message stay up
@@ -18,6 +19,9 @@ pub(crate) fn status_after_output(
     if let Some(status) = current_status {
         if is_case_mode_status(status) {
             return Some(status.to_owned());
+        }
+        if status == INVALID_PATTERN {
+            return Some(INVALID_PATTERN.to_owned());
         }
         if status.starts_with(PATTERN_NOT_FOUND) {
             return match match_label {
