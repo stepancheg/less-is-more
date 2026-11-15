@@ -115,41 +115,8 @@ impl<'a> Parser<'a> {
     /// of input. `col` is the width of spans already taken on this line.
     /// The stopping control is not consumed.
     fn take_text(&mut self, col: Width) -> TerminalString {
-        let mut content = TerminalString::with_capacity(0);
-        loop {
-            let Some(ch) = self.lookahead_char() else {
-                break;
-            };
-            if ch == '\t' {
-                self.push_tab(&mut content, col);
-                continue;
-            }
-            // Newline, CR, ESC, and other controls are classified by `next_span`.
-            if ch.is_control() {
-                break;
-            }
-            // Consume one grapheme. Always advance by at least one
-            // char so a degenerate empty grapheme cannot spin.
-            let n;
-            let term_char;
-            {
-                let Some(grapheme) = self.rem_input.graphemes(true).next() else {
-                    self.next_char();
-                    continue;
-                };
-                n = grapheme.len();
-                term_char = TerminalChar::new(grapheme);
-            }
-            if n == 0 {
-                self.next_char();
-                continue;
-            }
-            self.rem_input = &self.rem_input[n..];
-            let Some(term_char) = term_char else {
-                continue;
-            };
-            content.push(term_char);
-        }
+        let (consumed, content) = take_text_prefix(self.rem_input, col);
+        self.rem_input = &self.rem_input[consumed..];
         content
     }
 
@@ -194,17 +161,6 @@ impl<'a> Parser<'a> {
         self.next_char();
     }
 
-    /// Consume a tab and append spaces to `content` up to the next tab stop.
-    /// The next input char must be a tab. `col` is the width before `content`.
-    fn push_tab(&mut self, content: &mut TerminalString, col: Width) {
-        self.next_char();
-        let at = col + content.width();
-        let spaces = 8 - (at.0 % 8);
-        for _ in 0..spaces {
-            content.push_str(TerminalStr::SPACE);
-        }
-    }
-
     /// OSC body (after `ESC ]`). Consumes it from `rem_input`.
     /// Ends at BEL or at the ST sequence (ESC + backslash).
     fn consume_osc(&mut self) {
@@ -226,6 +182,88 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Take a prefix of `s` as terminal text.
+///
+/// Returns the number of bytes consumed and the text built from them.
+/// Stops before a control other than tab; that control is not consumed.
+/// `col` is the display column at the start of `s`, used to expand tabs.
+///
+/// If `s` is printable ASCII up to the next control or EOF, that run is
+/// copied in one piece. Otherwise the ASCII attempt is abandoned and the
+/// prefix is taken with a grapheme walk.
+fn take_text_prefix(s: &str, col: Width) -> (usize, TerminalString) {
+    match ascii_run_to_control(s) {
+        Some(ascii_run_bytes) => {
+            let run = &s[..ascii_run_bytes];
+            let width = Width::try_from(ascii_run_bytes).unwrap_or(Width(u32::MAX));
+            let mut content = TerminalString::with_capacity(ascii_run_bytes);
+            content.push_str(TerminalStr::unchecked_new(run, width));
+            (ascii_run_bytes, content)
+        }
+        None => take_text_prefix_graphemes(s, col),
+    }
+}
+
+/// Length of a leading printable-ASCII run that ends at a control or at
+/// the end of `s`. `None` if the first byte is not printable ASCII, or if
+/// a non-ASCII byte appears before the next control. The caller then
+/// abandons the ASCII path.
+fn ascii_run_to_control(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut ascii_run_bytes = 0usize;
+    while ascii_run_bytes < bytes.len() {
+        let b = bytes[ascii_run_bytes];
+        if b.is_ascii_graphic() || b == b' ' {
+            ascii_run_bytes += 1;
+            continue;
+        }
+        // Reached a control (or DEL). The run is printable ASCII through here.
+        if b < 0x20 || b == 0x7f {
+            break;
+        }
+        // Non-ASCII before any control: not an ASCII-to-control run.
+        return None;
+    }
+    if ascii_run_bytes == 0 {
+        return None;
+    }
+    Some(ascii_run_bytes)
+}
+
+/// Grapheme walk: one cluster at a time, tabs expanded, stop before a
+/// control other than tab.
+fn take_text_prefix_graphemes(s: &str, col: Width) -> (usize, TerminalString) {
+    let mut content = TerminalString::with_capacity(0);
+    let mut consumed = 0usize;
+    for (idx, grapheme) in s.grapheme_indices(true) {
+        // An empty cluster does not advance `consumed` (`idx + 0`).
+        // Continuing could spin on the same index. Stop and let the
+        // caller drop one character.
+        if grapheme.is_empty() {
+            break;
+        }
+        if grapheme == "\t" {
+            let at = col + content.width();
+            let spaces = 8 - (at.0 % 8);
+            for _ in 0..spaces {
+                content.push_str(TerminalStr::SPACE);
+            }
+            consumed = idx + grapheme.len();
+            continue;
+        }
+        // Newline, CR, ESC, and other controls are left for the caller.
+        if grapheme.chars().next().is_some_and(char::is_control) {
+            consumed = idx;
+            break;
+        }
+        consumed = idx + grapheme.len();
+        if let Some(term_char) = TerminalChar::new(grapheme) {
+            content.push(term_char);
+        }
+    }
+    (consumed, content)
+}
+
 /// Result of `next_span`: a span, a newline, or end of input.
 enum NextSpan {
     Span(Span),
@@ -239,6 +277,7 @@ mod tests {
     use crate::terminal::line::Line;
     use crate::terminal::parse::Parser;
     use crate::terminal::parse::parse_command_output;
+    use crate::terminal::parse::take_text_prefix;
     use crate::terminal::style::Style;
     use crate::terminal::width::Width;
 
@@ -375,5 +414,56 @@ mod tests {
 
     fn span_text(span: &crate::terminal::span::Span) -> &str {
         span.content.as_ref().as_str()
+    }
+
+    #[test]
+    fn test_take_text_prefix_ascii_run() {
+        let (consumed, content) = take_text_prefix("hello\nworld", Width(0));
+        assert_eq!(5, consumed);
+        assert_eq!("hello", content.as_ref().as_str());
+        assert_eq!(Width(5), content.width());
+    }
+
+    #[test]
+    fn test_take_text_prefix_stops_before_control() {
+        let (consumed, content) = take_text_prefix("ab\x1b[31m", Width(0));
+        assert_eq!(2, consumed);
+        assert_eq!("ab", content.as_ref().as_str());
+    }
+
+    #[test]
+    fn test_take_text_prefix_ascii_stops_before_tab() {
+        // Printable ASCII up to a control is the ASCII path. Tab is a
+        // control, so it is not consumed here.
+        let (consumed, content) = take_text_prefix("a\tb", Width(1));
+        assert_eq!(1, consumed);
+        assert_eq!("a", content.as_ref().as_str());
+        assert_eq!(Width(1), content.width());
+    }
+
+    #[test]
+    fn test_take_text_prefix_tab_uses_col() {
+        // Starts with tab, so the ASCII path is abandoned. col 2, tab
+        // expands to the next stop at col 8, then "b".
+        let (consumed, content) = take_text_prefix("\tb", Width(2));
+        assert_eq!(2, consumed);
+        assert_eq!("      b", content.as_ref().as_str());
+        assert_eq!(Width(7), content.width());
+    }
+
+    #[test]
+    fn test_take_text_prefix_combining_and_wide() {
+        let (consumed, content) = take_text_prefix("a中a\u{0308}\n", Width(0));
+        assert_eq!("a中a\u{0308}".len(), consumed);
+        assert_eq!("a中a\u{0308}", content.as_ref().as_str());
+        assert_eq!(Width(4), content.width());
+    }
+
+    #[test]
+    fn test_take_text_prefix_skips_zero_width() {
+        let (consumed, content) = take_text_prefix("a\u{200B}b", Width(0));
+        assert_eq!("a\u{200B}b".len(), consumed);
+        assert_eq!("ab", content.as_ref().as_str());
+        assert_eq!(Width(2), content.width());
     }
 }
