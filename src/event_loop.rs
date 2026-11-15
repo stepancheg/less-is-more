@@ -437,7 +437,7 @@ impl EventLoop {
                 self.renderer
                     .set_prompt_status(prompt.status_label(), prompt.caret_cols());
                 self.mode = Mode::Prompt(prompt);
-                self.renderer.redraw(&mut io::stdout(), size)?;
+                self.renderer.draw(&mut io::stdout(), size)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::SetMark => self.begin_mark(MarkOp::Set),
