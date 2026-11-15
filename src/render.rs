@@ -16,10 +16,23 @@ use crate::terminal::line::Line;
 use crate::terminal::width::Width;
 use crate::terminal_bg::TerminalBg;
 use crate::theme::search_highlight;
+use crate::wrapped_row::WrappedRow;
 
-/// Styled view of parsed lines. `row` is the top rendered-row index.
+/// Place in the original `\n`-separated lines, before wrapping.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LinePos {
+    /// Index of the original `\n`-separated line.
+    pub(crate) line: usize,
+    /// Byte offset into that line. The viewport starts on the wrapped
+    /// row that contains this byte, so a width change keeps the same
+    /// text at the top.
+    pub(crate) offset: usize,
+}
+
+/// Styled view of parsed lines.
 pub(crate) struct Renderer {
-    row: u32,
+    /// Top of the viewport in original-line coordinates.
+    pos: LinePos,
     lines: Vec<Line>,
     drawn: Option<DrawnFrame>,
     terminal_bg: TerminalBg,
@@ -48,7 +61,7 @@ struct DrawnFrame {
 impl Renderer {
     pub(crate) fn new(terminal_bg: TerminalBg) -> Renderer {
         Renderer {
-            row: 0,
+            pos: LinePos::default(),
             lines: Vec::new(),
             drawn: None,
             terminal_bg,
@@ -94,48 +107,59 @@ impl Renderer {
 
     pub(crate) fn set_lines(&mut self, lines: Vec<Line>, size: Size) {
         self.lines = lines;
-        self.clamp_row(size);
+        self.clamp_pos_to_lines();
+        self.set_top_row(self.viewport_top_row(size), size);
     }
 
     pub(crate) fn scroll_down(&mut self, size: Size) {
-        self.row = self.row.saturating_add(1);
-        self.clamp_row(size);
+        let top = self.viewport_top_row(size);
+        self.set_top_row(top.saturating_add(WrappedRow(1)), size);
     }
 
-    pub(crate) fn scroll_up(&mut self) {
-        self.row = self.row.saturating_sub(1);
+    pub(crate) fn scroll_up(&mut self, size: Size) {
+        let top = self.viewport_top_row(size);
+        self.set_top_row(top.saturating_sub(WrappedRow(1)), size);
     }
 
     pub(crate) fn scroll_top(&mut self) {
-        self.row = 0;
+        self.pos = LinePos::default();
     }
 
     pub(crate) fn scroll_bottom(&mut self, size: Size) {
-        self.row = u32::MAX;
-        self.clamp_row(size);
+        self.set_top_row(WrappedRow::MAX, size);
     }
 
     pub(crate) fn scroll_page_down(&mut self, size: Size) {
         let step = cmp::max(content_height(size.height.0), 1);
-        self.row = self.row.saturating_add(step);
-        self.clamp_row(size);
+        let top = self.viewport_top_row(size);
+        self.set_top_row(top.saturating_add(WrappedRow(step)), size);
     }
 
     pub(crate) fn scroll_page_up(&mut self, size: Size) {
         let step = cmp::max(content_height(size.height.0), 1);
-        self.row = self.row.saturating_sub(step);
+        let top = self.viewport_top_row(size);
+        self.set_top_row(top.saturating_sub(WrappedRow(step)), size);
     }
 
+    pub(crate) fn scroll_to_pos(&mut self, pos: LinePos, size: Size) {
+        self.pos = pos;
+        self.clamp_pos_to_lines();
+        self.set_top_row(self.viewport_top_row(size), size);
+    }
+
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn scroll_to_line(&mut self, line_idx: usize, size: Size) {
-        self.row = visual_row_of_logical_line(&self.lines, size.width, line_idx);
-        self.clamp_row(size);
+        self.set_top_row(
+            visual_row_of_logical_line(&self.lines, size.width, line_idx),
+            size,
+        );
     }
 
     pub(crate) fn scroll_to_match(&mut self, line_idx: usize, byte_start: usize, size: Size) {
         let base = visual_row_of_logical_line(&self.lines, size.width, line_idx);
         let offset = match self.lines.get(line_idx) {
             Some(line) => visual_row_offset_for_byte(line, size.width, byte_start),
-            None => 0,
+            None => WrappedRow(0),
         };
         let match_row = base.saturating_add(offset);
         let body = content_height(size.height.0);
@@ -143,27 +167,30 @@ impl Renderer {
         // off-screen, center it in the content area, as Neovim does for a
         // jump that moves the cursor outside the window.
         if body == 0 {
-            self.row = match_row;
-            self.clamp_row(size);
+            self.set_top_row(match_row, size);
             return;
         }
-        let top = self.row;
-        let bottom = top.saturating_add(body - 1);
+        let top = self.viewport_top_row(size);
+        let bottom = top.saturating_add(WrappedRow(body - 1));
         if match_row < top || match_row > bottom {
-            self.row = match_row.saturating_sub(body / 2);
+            self.set_top_row(match_row.saturating_sub(WrappedRow(body / 2)), size);
         }
-        self.clamp_row(size);
     }
 
-    pub(crate) fn top_row(&self) -> u32 {
-        self.row
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn top_row(&self, size: Size) -> WrappedRow {
+        self.viewport_top_row(size)
+    }
+
+    pub(crate) fn top_pos(&self, size: Size) -> LinePos {
+        pos_of_wrapped_row(&self.lines, size.width, self.viewport_top_row(size))
     }
 
     pub(crate) fn top_line_index(&self, size: Size) -> usize {
         if self.lines.is_empty() {
             return 0;
         }
-        logical_line_at_visual_row(&self.lines, size.width, self.row)
+        self.top_pos(size).line
     }
 
     pub(crate) fn bottom_line_index(&self, size: Size) -> usize {
@@ -171,17 +198,19 @@ impl Renderer {
             return 0;
         }
         let body = content_height(size.height.0);
-        let count = visual_rows(&self.lines, size.width, None, false).len();
+        let count = visual_row_count(&self.lines, size.width);
         if count == 0 {
             return 0;
         }
+        let top = self.viewport_top_row(size);
         let last = if body == 0 {
-            self.row as usize
+            top
         } else {
-            self.row as usize + body as usize - 1
+            top.saturating_add(WrappedRow(body - 1))
         };
-        let last = cmp::min(last, count - 1);
-        logical_line_at_visual_row(&self.lines, size.width, last as u32)
+        let max_index = WrappedRow::try_from(count - 1).unwrap_or(WrappedRow::MAX);
+        let last = cmp::min(last, max_index);
+        logical_line_at_visual_row(&self.lines, size.width, last)
     }
 
     pub(crate) fn draw(&mut self, out: &mut impl Write, size: Size) -> io::Result<()> {
@@ -202,8 +231,11 @@ impl Renderer {
             self.highlight.as_ref(),
             light_terminal,
         );
-        self.row = cmp::min(self.row, max_row(all.len(), body_height));
-        let start = cmp::min(self.row as usize, all.len());
+        let top = cmp::min(
+            wrapped_row_of_pos(&self.lines, terminal_width, self.pos),
+            max_row(all.len(), body_height),
+        );
+        let start = cmp::min(top.as_usize(), all.len());
         let end = cmp::min(start.saturating_add(body_height as usize), all.len());
         let at_end = end == all.len();
         let mut all = all;
@@ -249,9 +281,30 @@ impl Renderer {
         Ok(())
     }
 
-    fn clamp_row(&mut self, size: Size) {
-        let count = visual_rows(&self.lines, size.width, None, false).len();
-        self.row = cmp::min(self.row, max_row(count, content_height(size.height.0)));
+    fn viewport_top_row(&self, size: Size) -> WrappedRow {
+        let count = visual_row_count(&self.lines, size.width);
+        let row = wrapped_row_of_pos(&self.lines, size.width, self.pos);
+        cmp::min(row, max_row(count, content_height(size.height.0)))
+    }
+
+    fn set_top_row(&mut self, row: WrappedRow, size: Size) {
+        let count = visual_row_count(&self.lines, size.width);
+        let row = cmp::min(row, max_row(count, content_height(size.height.0)));
+        self.pos = pos_of_wrapped_row(&self.lines, size.width, row);
+    }
+
+    fn clamp_pos_to_lines(&mut self) {
+        if self.lines.is_empty() {
+            self.pos = LinePos::default();
+            return;
+        }
+        if self.pos.line >= self.lines.len() {
+            self.pos.line = self.lines.len() - 1;
+        }
+        let len = line_byte_len(&self.lines[self.pos.line]);
+        if self.pos.offset > len {
+            self.pos.offset = len;
+        }
     }
 }
 
@@ -260,12 +313,12 @@ fn content_height(terminal_height: u32) -> u32 {
     terminal_height.saturating_sub(1)
 }
 
-fn max_row(visual_row_count: usize, body_height: u32) -> u32 {
+fn max_row(visual_row_count: usize, body_height: u32) -> WrappedRow {
     if body_height == 0 {
-        return 0;
+        return WrappedRow(0);
     }
-    let visual_row_count = u32::try_from(visual_row_count).unwrap_or(u32::MAX);
-    visual_row_count.saturating_sub(body_height)
+    let visual_row_count = WrappedRow::try_from(visual_row_count).unwrap_or(WrappedRow::MAX);
+    visual_row_count.saturating_sub(WrappedRow(body_height))
 }
 
 struct VisualRow {
@@ -395,24 +448,101 @@ fn slice_cols(s: &str, skip_cols: u32, max_cols: u32) -> String {
     out
 }
 
-fn visual_row_of_logical_line(lines: &[Line], terminal_width: Width, line_idx: usize) -> u32 {
-    let mut acc = 0u32;
+fn visual_row_count(lines: &[Line], terminal_width: Width) -> usize {
+    visual_rows(lines, terminal_width, None, false).len()
+}
+
+fn line_byte_len(line: &Line) -> usize {
+    let mut n = 0;
+    for span in &line.spans {
+        n += span.content.as_ref().len();
+    }
+    n
+}
+
+fn wrapped_row_of_pos(lines: &[Line], terminal_width: Width, pos: LinePos) -> WrappedRow {
+    if lines.is_empty() {
+        return WrappedRow(0);
+    }
+    let line_idx = cmp::min(pos.line, lines.len() - 1);
+    let base = visual_row_of_logical_line(lines, terminal_width, line_idx);
+    let offset = visual_row_offset_for_byte(&lines[line_idx], terminal_width, pos.offset);
+    base.saturating_add(offset)
+}
+
+fn pos_of_wrapped_row(lines: &[Line], terminal_width: Width, row: WrappedRow) -> LinePos {
+    if lines.is_empty() {
+        return LinePos::default();
+    }
+    let count = visual_row_count(lines, terminal_width);
+    if count == 0 {
+        return LinePos::default();
+    }
+    let last = WrappedRow::try_from(count - 1).unwrap_or(WrappedRow::MAX);
+    let row = cmp::min(row, last);
+    let line = logical_line_at_visual_row(lines, terminal_width, row);
+    let base = visual_row_of_logical_line(lines, terminal_width, line);
+    let within = row.saturating_sub(base);
+    let offset = byte_offset_at_wrap_row(&lines[line], terminal_width, within);
+    LinePos { line, offset }
+}
+
+/// Byte offset of the first character placed on wrap-row `target` of `line`.
+fn byte_offset_at_wrap_row(line: &Line, terminal_width: Width, target: WrappedRow) -> usize {
+    if terminal_width == 0 || target == WrappedRow(0) {
+        return 0;
+    }
+    let mut col = Width(0);
+    let mut row = WrappedRow(0);
+    let mut byte_off = 0usize;
+    for span in &line.spans {
+        for ch in span.content.as_ref().chars() {
+            let text = ch.as_str().as_str();
+            let w = ch.width();
+            if w > terminal_width {
+                byte_off += text.len();
+                continue;
+            }
+            if col + w > terminal_width {
+                row = row.saturating_add(WrappedRow(1));
+                col = Width(0);
+                if row == target {
+                    return byte_off;
+                }
+            }
+            col += w;
+            byte_off += text.len();
+        }
+    }
+    byte_off
+}
+
+fn visual_row_of_logical_line(
+    lines: &[Line],
+    terminal_width: Width,
+    line_idx: usize,
+) -> WrappedRow {
+    let mut acc = WrappedRow(0);
     for line in lines.iter().take(line_idx) {
-        let n = u32::try_from(line_visual_rows(line, terminal_width, None, 0, false).len())
-            .unwrap_or(u32::MAX);
+        let n = WrappedRow::try_from(line_visual_rows(line, terminal_width, None, 0, false).len())
+            .unwrap_or(WrappedRow::MAX);
         acc = acc.saturating_add(n);
     }
     acc
 }
 
-fn logical_line_at_visual_row(lines: &[Line], terminal_width: Width, visual_row: u32) -> usize {
-    let mut acc = 0u32;
+fn logical_line_at_visual_row(
+    lines: &[Line],
+    terminal_width: Width,
+    visual_row: WrappedRow,
+) -> usize {
+    let mut acc = WrappedRow(0);
     for (i, line) in lines.iter().enumerate() {
-        let n = u32::try_from(line_visual_rows(line, terminal_width, None, 0, false).len())
-            .unwrap_or(u32::MAX);
+        let n = WrappedRow::try_from(line_visual_rows(line, terminal_width, None, 0, false).len())
+            .unwrap_or(WrappedRow::MAX);
         // A blank line still occupies one visual row, so n is at least 1
         // unless the terminal width is 0.
-        let n = cmp::max(n, 1);
+        let n = cmp::max(n, WrappedRow(1));
         if visual_row < acc.saturating_add(n) {
             return i;
         }
@@ -476,26 +606,30 @@ fn visual_rows(
     rows
 }
 
-fn visual_row_offset_for_byte(line: &Line, terminal_width: Width, byte_start: usize) -> u32 {
+fn visual_row_offset_for_byte(line: &Line, terminal_width: Width, byte_start: usize) -> WrappedRow {
     if terminal_width == 0 {
-        return 0;
+        return WrappedRow(0);
     }
     let mut col = Width(0);
-    let mut row = 0u32;
+    let mut row = WrappedRow(0);
     let mut byte_off = 0usize;
     for span in &line.spans {
         for ch in span.content.as_ref().chars() {
+            let text = ch.as_str().as_str();
+            let w = ch.width();
             if byte_off >= byte_start {
+                // The char at byte_start may itself open the next wrap row.
+                if w <= terminal_width && col + w > terminal_width {
+                    row = row.saturating_add(WrappedRow(1));
+                }
                 return row;
             }
-            let text = ch.as_str().as_str();
             byte_off += text.len();
-            let w = ch.width();
             if w > terminal_width {
                 continue;
             }
             if col + w > terminal_width {
-                row = row.saturating_add(1);
+                row = row.saturating_add(WrappedRow(1));
                 col = Width(0);
             }
             col += w;
@@ -748,6 +882,36 @@ mod tests {
         assert_eq!("a", row_text(&parser, 0, 10));
         assert_eq!("b", row_text(&parser, 1, 10));
         assert_eq!("", row_text(&parser, 2, 10));
+        renderer.scroll_bottom(size(10, 3));
+        let saved = renderer.top_pos(size(10, 3));
+        renderer.scroll_top();
+        renderer.scroll_to_pos(saved, size(10, 3));
+        assert_eq!(saved, renderer.top_pos(size(10, 3)));
+    }
+
+    #[test]
+    fn test_scroll_position_follows_text_across_width_change() {
+        let mut renderer = Renderer::new(TerminalBg::Dark);
+        // Width 5 wraps "0123456789abcdefghij" into 01234/56789/abcde/fghij.
+        renderer.set_lines(
+            parse_command_output(b"0123456789abcdefghij\nWXYZ\n"),
+            size(5, 3),
+        );
+        renderer.scroll_down(size(5, 3));
+        renderer.scroll_down(size(5, 3));
+        let mut buf = Vec::new();
+        renderer.draw(&mut buf, size(5, 3)).unwrap();
+        let mut parser = vt100::Parser::new(3, 5, 0);
+        parser.process(&buf);
+        assert_eq!("abcde", row_text(&parser, 0, 5));
+        // Width 8 wraps that line into 01234567/89abcdef/ghij. Byte 10
+        // ('a') sits on "89abcdef". A stale wrapped-row index of 2 would
+        // show "ghij" instead.
+        buf.clear();
+        renderer.draw(&mut buf, size(8, 3)).unwrap();
+        let mut parser = vt100::Parser::new(3, 8, 0);
+        parser.process(&buf);
+        assert_eq!("89abcdef", row_text(&parser, 0, 8));
     }
 
     #[test]

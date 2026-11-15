@@ -11,6 +11,9 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::abort_on_drop_handle::AbortOnDropHandle;
 use crate::help::help_lines;
+use crate::mark::MarkOp;
+use crate::mark::Marks;
+use crate::mark::NOT_SET;
 use crate::notify_pair::NotifyTx;
 use crate::render::Renderer;
 use crate::render::terminal_size;
@@ -40,6 +43,8 @@ enum Mode {
     Prompt(Prompt),
     /// Waiting for the option letter after `-`.
     Dash,
+    /// Waiting for the mark name after `m` or `'`.
+    Mark(MarkOp),
 }
 
 /// On-screen state for output, help, and the search prompt.
@@ -48,6 +53,7 @@ pub(crate) struct EventLoop {
     help_renderer: Renderer,
     search: Search,
     history: History,
+    marks: Marks,
     mode: Mode,
 }
 
@@ -58,6 +64,7 @@ impl EventLoop {
             help_renderer: Renderer::new(terminal_bg),
             search: Search::new(),
             history,
+            marks: Marks::default(),
             mode: Mode::Output,
         }
     }
@@ -120,7 +127,7 @@ impl EventLoop {
         self.renderer.set_lines(lines, size);
         self.search.reattach(self.renderer.lines(), anchor);
         self.search.apply_highlight(&mut self.renderer);
-        if !matches!(self.mode, Mode::Prompt(_) | Mode::Dash) {
+        if !matches!(self.mode, Mode::Prompt(_) | Mode::Dash | Mode::Mark(_)) {
             let label = status_after_output(
                 self.renderer.status_label(),
                 self.search.match_label(self.renderer.lines()),
@@ -140,6 +147,9 @@ impl EventLoop {
         }
         if matches!(self.mode, Mode::Dash) {
             return self.on_dash_key(key);
+        }
+        if matches!(self.mode, Mode::Mark(_)) {
+            return self.on_mark_key(key);
         }
         if matches!(self.mode, Mode::Help) {
             return self.on_help_key(key);
@@ -219,6 +229,61 @@ impl EventLoop {
         Ok(())
     }
 
+    fn begin_mark(&mut self, op: MarkOp) -> anyhow::Result<KeyResult> {
+        let size = terminal_size()?;
+        self.mode = Mode::Mark(op);
+        self.renderer
+            .set_prompt_status(op.prompt_label().to_owned(), 1);
+        self.renderer.redraw(&mut io::stdout(), size)?;
+        Ok(KeyResult::Continue)
+    }
+
+    fn on_mark_key(&mut self, key: KeyEvent) -> anyhow::Result<KeyResult> {
+        let op = match mem::replace(&mut self.mode, Mode::Output) {
+            Mode::Mark(op) => op,
+            other => {
+                self.mode = other;
+                return Ok(KeyResult::Continue);
+            }
+        };
+        let size = terminal_size()?;
+        let name = match key.code {
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                c
+            }
+            _ => {
+                let label = self.search.match_label(self.renderer.lines());
+                self.renderer.set_status_label(label);
+                self.renderer.redraw(&mut io::stdout(), size)?;
+                return Ok(KeyResult::Continue);
+            }
+        };
+        match op {
+            MarkOp::Set => {
+                self.marks.rows.insert(name, self.renderer.top_pos(size));
+                let label = self.search.match_label(self.renderer.lines());
+                self.renderer.set_status_label(label);
+                self.renderer.redraw(&mut io::stdout(), size)?;
+            }
+            MarkOp::Goto => {
+                let Some(pos) = self.marks.rows.get(&name).copied() else {
+                    self.renderer.set_status_label(Some(NOT_SET.to_owned()));
+                    self.renderer.redraw(&mut io::stdout(), size)?;
+                    return Ok(KeyResult::Continue);
+                };
+                self.search.clear_match();
+                self.search.apply_highlight(&mut self.renderer);
+                self.renderer.set_status_label(None);
+                self.renderer.scroll_to_pos(pos, size);
+                self.renderer.redraw(&mut io::stdout(), size)?;
+            }
+        }
+        Ok(KeyResult::Continue)
+    }
+
     fn on_help_key(&mut self, key: KeyEvent) -> anyhow::Result<KeyResult> {
         let Some(action) = key_action(&key) else {
             return Ok(KeyResult::Continue);
@@ -234,7 +299,7 @@ impl EventLoop {
                 let Some(status) = self.renderer.status_label() else {
                     return Ok(KeyResult::Continue);
                 };
-                if status.starts_with(PATTERN_NOT_FOUND) || status == NO_PREVIOUS_SEARCH {
+                if is_dismissable_status(status) {
                     let label = self.search.match_label(self.renderer.lines());
                     self.renderer.set_status_label(label);
                 }
@@ -245,7 +310,9 @@ impl EventLoop {
             KeyAction::SearchForward
             | KeyAction::SearchBackward
             | KeyAction::SearchNext
-            | KeyAction::SearchPrev => Ok(KeyResult::Continue),
+            | KeyAction::SearchPrev
+            | KeyAction::SetMark
+            | KeyAction::GotoMark => Ok(KeyResult::Continue),
             action @ (KeyAction::ScrollDown
             | KeyAction::ScrollUp
             | KeyAction::Redraw
@@ -275,7 +342,7 @@ impl EventLoop {
                 let Some(status) = self.renderer.status_label() else {
                     return Ok(KeyResult::Continue);
                 };
-                if !status.starts_with(PATTERN_NOT_FOUND) && status != NO_PREVIOUS_SEARCH {
+                if !is_dismissable_status(status) {
                     return Ok(KeyResult::Continue);
                 }
                 let size = terminal_size()?;
@@ -304,6 +371,8 @@ impl EventLoop {
                 self.renderer.redraw(&mut io::stdout(), size)?;
                 Ok(KeyResult::Continue)
             }
+            KeyAction::SetMark => self.begin_mark(MarkOp::Set),
+            KeyAction::GotoMark => self.begin_mark(MarkOp::Goto),
             KeyAction::SearchNext | KeyAction::SearchPrev => {
                 let size = terminal_size()?;
                 let reverse = matches!(action, KeyAction::SearchPrev);
@@ -370,7 +439,7 @@ fn apply_view_action(view: &mut Renderer, action: KeyAction) -> anyhow::Result<(
             view.draw(&mut io::stdout(), size)?;
         }
         KeyAction::ScrollUp => {
-            view.scroll_up();
+            view.scroll_up(size);
             view.draw(&mut io::stdout(), size)?;
         }
         KeyAction::Redraw => {
@@ -400,7 +469,9 @@ fn apply_view_action(view: &mut Renderer, action: KeyAction) -> anyhow::Result<(
         | KeyAction::SearchForward
         | KeyAction::SearchBackward
         | KeyAction::SearchNext
-        | KeyAction::SearchPrev => {}
+        | KeyAction::SearchPrev
+        | KeyAction::SetMark
+        | KeyAction::GotoMark => {}
     }
     Ok(())
 }
@@ -423,6 +494,8 @@ enum KeyAction {
     ScrollPageDown,
     ScrollPageUp,
     Redraw,
+    SetMark,
+    GotoMark,
 }
 
 /// Receive key presses until one arrives, or the reader ends.
@@ -437,6 +510,10 @@ async fn recv_key_press(keys: &mut UnboundedReceiver<io::Result<Event>>) -> io::
             None => return Err(io::Error::other("key reader stopped")),
         }
     }
+}
+
+fn is_dismissable_status(status: &str) -> bool {
+    status.starts_with(PATTERN_NOT_FOUND) || status == NO_PREVIOUS_SEARCH || status == NOT_SET
 }
 
 fn key_action(key: &KeyEvent) -> Option<KeyAction> {
@@ -461,10 +538,12 @@ fn key_action(key: &KeyEvent) -> Option<KeyAction> {
         KeyCode::Char('?') => Some(KeyAction::SearchBackward),
         KeyCode::Char('n') => Some(KeyAction::SearchNext),
         KeyCode::Char('N') => Some(KeyAction::SearchPrev),
+        KeyCode::Char('m') => Some(KeyAction::SetMark),
+        KeyCode::Char('\'') => Some(KeyAction::GotoMark),
         KeyCode::Char('j') | KeyCode::Down | KeyCode::Enter => Some(KeyAction::ScrollDown),
         KeyCode::Char('k') | KeyCode::Up => Some(KeyAction::ScrollUp),
-        KeyCode::Char('g') => Some(KeyAction::ScrollTop),
-        KeyCode::Char('G') => Some(KeyAction::ScrollBottom),
+        KeyCode::Char('g') | KeyCode::Home => Some(KeyAction::ScrollTop),
+        KeyCode::Char('G') | KeyCode::End => Some(KeyAction::ScrollBottom),
         KeyCode::Char(' ') | KeyCode::PageDown => Some(KeyAction::ScrollPageDown),
         KeyCode::PageUp => Some(KeyAction::ScrollPageUp),
         _ => None,
@@ -563,6 +642,42 @@ mod tests {
             matches!(
                 key_action(&press(KeyCode::Esc)),
                 Some(KeyAction::DismissMessage)
+            )
+        );
+    }
+
+    #[test]
+    fn test_home_end_scroll() {
+        assert_eq!(
+            true,
+            matches!(
+                key_action(&press(KeyCode::Home)),
+                Some(KeyAction::ScrollTop)
+            )
+        );
+        assert_eq!(
+            true,
+            matches!(
+                key_action(&press(KeyCode::End)),
+                Some(KeyAction::ScrollBottom)
+            )
+        );
+    }
+
+    #[test]
+    fn test_mark_keys() {
+        assert_eq!(
+            true,
+            matches!(
+                key_action(&press(KeyCode::Char('m'))),
+                Some(KeyAction::SetMark)
+            )
+        );
+        assert_eq!(
+            true,
+            matches!(
+                key_action(&press(KeyCode::Char('\''))),
+                Some(KeyAction::GotoMark)
             )
         );
     }

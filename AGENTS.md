@@ -5,8 +5,11 @@
 
 # Rust code style
 
-- Use `pub(crate)` for items shared within the crate
-- Prefer private (no `pub`) over `pub(crate)` where possible
+- Use the minimum visibility that works: private, then `pub(crate)`,
+  then `pub`. Use `pub(crate)` for items shared within the crate.
+  Prefer private (no `pub`) over `pub(crate)` where possible. A
+  `pub(crate)` item used only in its own module (including that
+  module's tests) must be private.
 - Use `"{x}"` instead of `"{}"` for format strings where `x` is the
   variable name
 - Do not use `map_or`, use `map(..).unwrap_or(..)` instead
@@ -35,3 +38,7 @@
   used only by tests use `#[cfg_attr(not(test), expect(dead_code))]`
 - Submodules are allowed only in `mod.rs`
 - No code in `mod.rs`, only `mod` declarations
+- No module may contain both code and submodules. A module is either
+  a `mod.rs` that only declares submodules, or a single file of code
+  with no `mod` declarations (inline `#[cfg(test)] mod tests` is
+  allowed). Do not write `mod foo;` in a file that also has items.

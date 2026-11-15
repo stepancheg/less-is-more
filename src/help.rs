@@ -11,12 +11,14 @@ Keys
   k, Up          Scroll up
   Space, PgDn    Page down
   PgUp           Page up
-  g              Top
-  G              Bottom
+  g, Home        Top
+  G, End         Bottom
   /              Search forward from the top of the screen
   ?              Search backward from the bottom of the screen
   n              Repeat search
   N              Repeat search in reverse
+  mx             Mark current position as x
+  'x             Go to mark x
   -i             Toggle ignore case
   -I             Always ignore case
   ^l             Redraw
@@ -62,7 +64,14 @@ mod tests {
             true,
             text.contains("?              Search backward from the bottom of the screen")
         );
+        assert_eq!(true, text.contains("g, Home        Top"));
+        assert_eq!(true, text.contains("G, End         Bottom"));
         assert_eq!(true, text.contains("n              Repeat search"));
+        assert_eq!(
+            true,
+            text.contains("mx             Mark current position as x")
+        );
+        assert_eq!(true, text.contains("'x             Go to mark x"));
         assert_eq!(true, text.contains("Up and Down recall previous searches."));
     }
 
@@ -71,12 +80,12 @@ mod tests {
         let mut renderer = Renderer::new(TerminalBg::Dark);
         let size = Size {
             width: Width(80),
-            height: Height(24),
+            height: Height(30),
         };
         renderer.set_lines(help_lines(), size);
         let mut buf = Vec::new();
         renderer.draw(&mut buf, size).unwrap();
-        let mut parser = vt100::Parser::new(24, 80, 0);
+        let mut parser = vt100::Parser::new(30, 80, 0);
         parser.process(&buf);
         assert_eq!(true, parser.screen().contents().contains("Show this help"));
         assert_eq!(true, parser.screen().contents().contains("(END)"));

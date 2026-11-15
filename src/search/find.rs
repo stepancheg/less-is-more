@@ -136,6 +136,7 @@ fn pos_before(line: usize, byte: usize, cur_line: usize, cur_byte: usize) -> boo
     line < cur_line || (line == cur_line && byte < cur_byte)
 }
 
+#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn find_forward(lines: &[Line], pattern: &str, start: usize) -> Option<usize> {
     if pattern.is_empty() {
         return None;
@@ -148,6 +149,7 @@ pub(crate) fn find_forward(lines: &[Line], pattern: &str, start: usize) -> Optio
     None
 }
 
+#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn find_backward(lines: &[Line], pattern: &str, start: usize) -> Option<usize> {
     if pattern.is_empty() || lines.is_empty() {
         return None;
@@ -169,6 +171,7 @@ pub(crate) fn find_backward(lines: &[Line], pattern: &str, start: usize) -> Opti
     }
 }
 
+#[cfg_attr(not(test), expect(dead_code))]
 fn line_contains(line: &Line, pattern: &str) -> bool {
     line.plain_text().contains(pattern)
 }
@@ -189,6 +192,7 @@ mod tests {
     use crate::terminal::width::Width;
     use crate::terminal_bg::TerminalBg;
     use crate::theme::NVIM_LIGHT_YELLOW;
+    use crate::wrapped_row::WrappedRow;
 
     fn size(width: u32, height: u32) -> Size {
         Size {
@@ -331,7 +335,7 @@ mod tests {
             submit_prompt(&mut renderer, &mut search, size, true, "TARGET".to_owned())
         );
         // body/2 == 2, so the hit sits on the middle row: top is line 8.
-        assert_eq!(8, renderer.top_row());
+        assert_eq!(WrappedRow(8), renderer.top_row(size));
         assert_eq!(8, renderer.top_line_index(size));
         assert_line_visible(&renderer, size, 10);
     }
@@ -351,8 +355,8 @@ mod tests {
             submit_prompt(&mut renderer, &mut search, size, true, "o".to_owned())
         );
         // "one" is already at the top; page must not move.
-        assert_eq!(0, renderer.top_row());
-        let top_before = renderer.top_row();
+        assert_eq!(WrappedRow(0), renderer.top_row(size));
+        let top_before = renderer.top_row(size);
         // Next hit is "two", still on this page.
         assert_eq!(
             SearchOutcome::Found,
@@ -362,7 +366,7 @@ mod tests {
             Some("[2/3]".to_owned()),
             search.match_label(renderer.lines())
         );
-        assert_eq!(top_before, renderer.top_row());
+        assert_eq!(top_before, renderer.top_row(size));
         // "four" is also on this page.
         assert_eq!(
             SearchOutcome::Found,
@@ -372,7 +376,7 @@ mod tests {
             Some("[3/3]".to_owned()),
             search.match_label(renderer.lines())
         );
-        assert_eq!(top_before, renderer.top_row());
+        assert_eq!(top_before, renderer.top_row(size));
     }
 
     #[test]

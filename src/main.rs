@@ -5,6 +5,7 @@ mod event_loop;
 mod height;
 mod help;
 mod interval_arg;
+mod mark;
 mod notify_pair;
 mod render;
 mod search;
@@ -13,6 +14,7 @@ mod terminal;
 mod terminal_bg;
 mod terminal_guard;
 mod theme;
+mod wrapped_row;
 
 use std::io;
 use std::panic;
