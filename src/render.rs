@@ -846,6 +846,8 @@ pub(crate) fn terminal_size() -> io::Result<Size> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU16;
+
     use crate::height::Height;
     use crate::render::Renderer;
     use crate::size::Size;
@@ -859,8 +861,8 @@ mod tests {
 
     fn vt_parser(rows: u16, cols: u16) -> vt100::Parser {
         vt100::Parser::new(
-            std::num::NonZeroU16::new(rows).unwrap(),
-            std::num::NonZeroU16::new(cols).unwrap(),
+            NonZeroU16::new(rows).unwrap(),
+            NonZeroU16::new(cols).unwrap(),
             0,
         )
     }

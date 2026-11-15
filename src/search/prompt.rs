@@ -242,6 +242,8 @@ fn prev_char_boundary(s: &str, index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU16;
+
     use crossterm::event::KeyCode;
     use crossterm::event::KeyEvent;
     use crossterm::event::KeyEventKind;
@@ -259,8 +261,8 @@ mod tests {
 
     fn vt_parser(rows: u16, cols: u16) -> vt100::Parser {
         vt100::Parser::new(
-            std::num::NonZeroU16::new(rows).unwrap(),
-            std::num::NonZeroU16::new(cols).unwrap(),
+            NonZeroU16::new(rows).unwrap(),
+            NonZeroU16::new(cols).unwrap(),
             0,
         )
     }

@@ -246,6 +246,8 @@ impl Search {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU16;
+
     use crate::height::Height;
     use crate::render::Renderer;
     use crate::search::find::SearchOutcome;
@@ -335,11 +337,8 @@ mod tests {
         );
         let mut buf = Vec::new();
         renderer.redraw(&mut buf, size).unwrap();
-        let mut parser = vt100::Parser::new(
-            std::num::NonZeroU16::new(6).unwrap(),
-            std::num::NonZeroU16::new(10).unwrap(),
-            0,
-        );
+        let mut parser =
+            vt100::Parser::new(NonZeroU16::new(6).unwrap(), NonZeroU16::new(10).unwrap(), 0);
         parser.process(&buf);
         // "FOO" on line 0 is now a hit.
         let cell = parser.screen().cell(0, 0).unwrap();
